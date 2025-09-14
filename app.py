@@ -335,11 +335,11 @@ from flask import request, jsonify
 def top_nav():
     return dbc.Navbar(
         dbc.Container([
-            # Home button
+            # Home button - use button with explicit JS navigation
             html.A(
                 dbc.Button("Home", color="secondary", className="me-2", id="home-btn"),
                 href="/",
-                className="nav-home-link",
+                className="nav-home-link direct-link",
                 style={"textDecoration":"none", "display":"inline-block", "padding":"0", "margin":"0"}
             ),
 
@@ -406,8 +406,14 @@ def home_stats(theme):
     covers = []
     for a in UNRATED_PICKS:
         p = get_or_make_thumb(Path(a["cover_png"]), (256,256))
-        covers.append(html.A(html.Img(src=image_to_data_uri(p), className="home-cover"),
-                             href=f"/album/{a['album_id']}", style={"textDecoration":"none"}))
+        covers.append(
+            html.A(
+                html.Img(src=image_to_data_uri(p), className="home-cover"),
+                href=f"/album/{a['album_id']}",
+                className="direct-link",
+                style={"textDecoration":"none"}
+            )
+        )
 
     cards = dbc.Row([
         dbc.Col(dbc.Card(dbc.CardBody([html.H5("Albums in library"), html.H2(n_albums)])), md=3),
@@ -432,10 +438,43 @@ def layout_home():
     ])
 
 def layout_search(results:List[dict]):
+    """Legacy search layout function - modal approach now used instead."""
+    search_items = []
+    for r in results:
+        a = ALBUMS[r["album_id"]]
+        thumb = get_or_make_thumb(Path(a["cover_png"]), (64,64))
+        img_uri = image_to_data_uri(thumb)
+
+        # highlight matched part in title/artist if possible
+        q = r.get("query","")
+        title_children = highlight_match(a["album_name"], q) if q else a["album_name"]
+        artist_children = highlight_match(a["artists"], q) if q else a["artists"]
+
+        search_items.append(
+            html.Div(
+                dbc.Card(
+                    dbc.CardBody([
+                        dbc.Row([
+                            dbc.Col(html.Img(src=img_uri, style={"height":"48px", "width":"48px", "borderRadius":"6px"}), width="auto"),
+                            dbc.Col([
+                                html.Div(title_children, className="search-title"),
+                                html.Div(artist_children, className="search-sub"),
+                                html.Div(r["why"], className="why-pill"),
+                            ]),
+                            dbc.Col(html.Div(a.get("year") or "", className="search-year"), width=2, style={"textAlign":"right"})
+                        ], className="align-items-center"),
+                    ]),
+                    className="search-result-item mb-2",
+                    id={"type": "search-result-card", "album_id": a["album_id"]},
+                ),
+                className="search-result-container",
+            )
+        )
+
     return html.Div([
         top_nav(),
         dbc.Container([
-            dbc.ListGroup([album_card_line(r) for r in results]) if results
+            html.Div(search_items, id="search-results") if results
             else html.Div("No matches.", className="muted")
         ], fluid=True)
     ])
@@ -592,6 +631,17 @@ def layout_album(album_id:str):
 # Provide a single global dcc.Location for routing + search state.
 app.layout = html.Div([
     dcc.Location(id="url", refresh=False),
+    # Search results modal that will be shown/hidden via callbacks
+    dbc.Modal(
+        [
+            dbc.ModalHeader(dbc.ModalTitle("Search Results"), close_button=True),
+            dbc.ModalBody(id="search-results-content"),
+        ],
+        id="search-results-modal",
+        size="lg",
+        is_open=False,
+        centered=True,
+    ),
     # 'page' will be filled by router callback (now allowed on initial call)
     html.Div(id="page")
 ])
@@ -613,8 +663,8 @@ def router(pathname:str):
 
 # Clear search box when navigating to an album so residual query doesn't interfere
 @app.callback(
-    Output("search-input","value", allow_duplicate=True),
-    Input("url","pathname"),
+    Output("search-input", "value", allow_duplicate=True),
+    Input("url", "pathname"),
     prevent_initial_call=True
 )
 def clear_search_on_album(pathname):
@@ -624,20 +674,118 @@ def clear_search_on_album(pathname):
 
 # search as-you-type
 @app.callback(
-    Output("page","children", allow_duplicate=True),
-    Input("search-input","value"),
-    State("url","pathname"),
+    Output("search-results-modal", "is_open"),
+    Output("search-results-content", "children"),
+    Input("search-input", "value"),
     prevent_initial_call=True
 )
-def do_search(q, path):
-    # Show search results on any page; if query cleared, revert contextually.
-    if q is None or q.strip()=="":
-        # If on album keep it, else go home.
-        if path and path.startswith("/album/"):
-            return dash.no_update
-        return [layout_home()]
+def do_search(q):
+    # Check if we have a context and if this was triggered by input change
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return False, dash.no_update
+    
+    # Show search results on any page; if query cleared, hide modal
+    if q is None or q.strip() == "":
+        return False, dash.no_update
+    
+    # Perform search and return results
     results = search_library(q)
-    return [layout_search(results)]
+    
+    if not results:
+        return True, html.Div("No matches.", className="muted")
+    
+    # Create the search result items using our new modal-friendly format
+    search_items = []
+    for r in results:
+        a = ALBUMS[r["album_id"]]
+        thumb = get_or_make_thumb(Path(a["cover_png"]), (64,64))
+        img_uri = image_to_data_uri(thumb)
+
+        # highlight matched part in title/artist if possible
+        q_highlight = r.get("query","")
+        title_children = highlight_match(a["album_name"], q_highlight) if q_highlight else a["album_name"]
+        artist_children = highlight_match(a["artists"], q_highlight) if q_highlight else a["artists"]
+
+        # Create a card that navigates to the album when clicked
+        search_items.append(
+            html.Div(
+                dbc.Card(
+                    dbc.CardBody([
+                        dbc.Row([
+                            dbc.Col(html.Img(src=img_uri, style={"height":"48px", "width":"48px", "borderRadius":"6px"}), width="auto"),
+                            dbc.Col([
+                                html.Div(title_children, className="search-title"),
+                                html.Div(artist_children, className="search-sub"),
+                                html.Div(r["why"], className="why-pill"),
+                            ]),
+                            dbc.Col(html.Div(a.get("year") or "", className="search-year"), width=2, style={"textAlign":"right"})
+                        ], className="align-items-center"),
+                    ]),
+                    className="search-result-item mb-2",
+                    id={"type": "search-result-card", "album_id": a["album_id"], "index": len(search_items)},
+                ),
+                className="search-result-container",
+            )
+        )
+    
+    return True, html.Div(search_items, id="search-results-list")
+
+# Handle clicks on search result cards
+@app.callback(
+    Output("url", "pathname"),
+    Input({"type": "search-result-card", "album_id": ALL, "index": ALL}, "n_clicks"),
+    prevent_initial_call=True
+)
+def handle_search_result_click(n_clicks_list):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return dash.no_update
+    
+    # Extract which card was clicked from the trigger ID
+    triggered_id = ctx.triggered[0]["prop_id"].split(".")[0]
+    
+    try:
+        album_id = json.loads(triggered_id)["album_id"]
+        
+        # Get the index of the clicked item
+        clicked_index = json.loads(triggered_id).get("index", -1)
+        
+        # Only check for None if we can identify which item was clicked
+        if clicked_index >= 0 and clicked_index < len(n_clicks_list):
+            # If this specific item hasn't been clicked (n_clicks is None), don't navigate
+            if n_clicks_list[clicked_index] is None:
+                #print(f"Ignoring initialization event for index {clicked_index}")
+                return dash.no_update
+        
+        # Navigate to album page (modal will be closed by the URL change callback)
+        print(f"Search result clicked - navigating to album {album_id}")
+        return f"/album/{album_id}"
+    except Exception as e:
+        print(f"Error in search click handler: {e}")
+        return dash.no_update
+
+# Combined callback to manage search modal visibility
+@app.callback(
+    Output("search-results-modal", "is_open", allow_duplicate=True),
+    [
+        Input("search-results-modal", "is_open"),
+        Input("url", "pathname")
+    ],
+    prevent_initial_call=True
+)
+def manage_search_modal(is_open, pathname):
+    # Get triggered component
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return dash.no_update
+    
+    # If URL changed, close the modal
+    trigger_id = ctx.triggered[0]["prop_id"]
+    if "url.pathname" in trigger_id:
+        return False
+    
+    return dash.no_update
 
 
 # Set rating from graph clicks (snap to 0.1)

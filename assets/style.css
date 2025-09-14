@@ -50,6 +50,45 @@ a, a:link, a:visited { outline: 1px solid rgba(255,0,0,0.5); }
 .search-year { color:#9aa3ad; }
 .why-pill { font-size: 0.75rem; color:#9aa3ad; }
 
+/* Enhanced search modal */
+.search-result-item {
+  background-color: #15171c;
+  border-color: #2a2d33;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  position: relative;
+  animation: fadeIn 0.2s forwards;
+}
+
+@keyframes fadeIn {
+  0% { opacity: 0.9; }
+  100% { opacity: 1; }
+}
+
+.search-result-item:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+  background-color: #1a1d24;
+}
+
+.search-result-container {
+  margin-bottom: 10px;
+}
+
+/* Modal customization */
+.modal-content {
+  background-color: #0e0f12;
+  border-color: #2a2d33;
+}
+
+.modal-header {
+  border-bottom-color: #2a2d33;
+}
+
+.modal-header .close {
+  color: #9aa3ad;
+}
+
 /* Home */
 .home-covers img.home-cover {
   height: 100px; width: 100px; border-radius: 12px; margin-right: 10px;
