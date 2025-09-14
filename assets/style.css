@@ -1,0 +1,66 @@
+/* Global */
+body { background: #0e0f12; }
+.muted { color:#9aa3ad; }
+.small { font-size: 0.85rem; }
+
+/* Constrain navbar home anchor so it doesn't overlay page content */
+.nav-home-link { display:inline-block; position:relative; }
+.nav-home-link::after { content:""; position:absolute; inset:0; }
+
+/* Search Results - Improved styling for better click behavior */
+#search-results-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+#search-results-list a {
+  transition: transform 0.1s ease;
+  display: block;
+  text-decoration: none;
+}
+
+#search-results-list a:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+}
+
+#search-results-container .search-result-item {
+  cursor: pointer;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+/* DEBUG: outline interactive elements 
+a, a:link, a:visited { outline: 1px solid rgba(255,0,0,0.5); }
+.search-result-item { outline: 1px solid rgba(0,255,0,0.6); }
+*/
+/* Navbar search centered look */
+.search-input {
+  max-width: 640px;
+  margin: 0 auto;
+  border-radius: 9999px;
+  background: #15171c;
+  color: #dfe2e7;
+}
+
+/* Search results */
+.search-title { font-weight: 600; }
+.search-sub { color:#9aa3ad; font-size:0.9rem; }
+.search-year { color:#9aa3ad; }
+.why-pill { font-size: 0.75rem; color:#9aa3ad; }
+
+/* Home */
+.home-covers img.home-cover {
+  height: 100px; width: 100px; border-radius: 12px; margin-right: 10px;
+}
+
+/* Album */
+.cover-big {
+  width: 100%; max-width: 320px; border-radius: 12px; margin-bottom: 10px;
+}
+.rank-box {
+  display: inline-block; padding: 8px 12px; border-radius: 10px;
+  background: #15171c; font-size: 1.25rem; font-weight: 700; color: #dfe2e7;
+}
+.ignore-pill { border-radius: 6px; }
