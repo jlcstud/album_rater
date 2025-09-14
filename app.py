@@ -556,8 +556,13 @@ def layout_album(album_id:str):
     ], className="gy-2")
 
     tracks_table = dbc.Table(
-        [html.Tr([html.Th("#"), html.Th("Title"), html.Th("Duration")])] + 
-        [html.Tr([html.Td(i+1), html.Td(t["title"]), html.Td(ms_to_mmss(t["duration_ms"]))]) for i,t in enumerate(alb["tracks"])],
+        [
+            html.Thead(html.Tr([html.Th("#"), html.Th("Title"), html.Th("Duration")])),
+            html.Tbody([
+                html.Tr([html.Td(i+1), html.Td(t["title"]), html.Td(ms_to_mmss(t["duration_ms"]))]) 
+                for i,t in enumerate(alb["tracks"])
+            ])
+        ],
         bordered=False, hover=True, size="sm", responsive=True, className="mt-3"
     )
 
