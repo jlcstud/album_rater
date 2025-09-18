@@ -1,3 +1,4 @@
 # Environment files
 .env
 output_spotify/
+**/__pycache__/
