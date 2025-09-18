@@ -328,7 +328,8 @@ def search_library(query:str) -> List[dict]:
     return results
 
 # --------- Dash App ----------
-app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY], suppress_callback_exceptions=True)
+app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY], suppress_callback_exceptions=True,
+           external_scripts=["/assets/drag.js"])
 server = app.server
 from flask import request, jsonify
 
@@ -501,31 +502,20 @@ def album_graph(album_id:str, theme:Dict):
     lines = ["#8fd4ff" if not I[i] else "#3a3d44" for i in range(len(x))]
 
     # Overlay scatter points (transparent) to capture click position vertically.
-    overlay_x = []
-    overlay_y = []
-    for xi in x:
-        for yv in np.linspace(0, 10, 101):  # 0.1 resolution
-            overlay_x.append(xi)
-            overlay_y.append(yv)
+    # This is no longer needed with the new JS-based drag/click handler.
 
     fig = {
         "data": [
             {
                 "type":"bar", "x": x, "y": y, "name":"Ratings",
                 "marker": {"color": colors, "line":{"width":2.5, "color": lines}},
-                "hoverinfo": "skip",  # skip so clicks prefer overlay markers
+                "hoverinfo": "skip",
                 "text": texts,
                 "textposition": "inside",
                 "textangle": 90,
                 "insidetextanchor": "start",
                 "cliponaxis": False,
                 "customdata": [[i, int(I[i])] for i in range(len(x))]
-            },
-            {
-                "type": "scatter", "x": overlay_x, "y": overlay_y, "mode": "markers",
-                "marker": {"size": 28, "color": "rgba(0,0,0,0)"},
-                "hoverinfo": "skip", "showlegend": False,
-                "name": "_overlay"
             }
         ],
         "layout": {
@@ -537,23 +527,23 @@ def album_graph(album_id:str, theme:Dict):
             "yaxis": {
                 "range":[0,10], "dtick":1, "gridcolor":"#2a2d33", "gridwidth":2,
                 "title":"Rating (0–10)",
-                "fixedrange": True  # disable vertical zoom/scroll
+                "fixedrange": True
             },
             "xaxis": {
                 "showgrid": True, "gridcolor":"#22252b", "tickmode":"array",
                 "tickvals": x, "ticktext": x, "tickfont":{"size":12},
-                "fixedrange": True  # disable horizontal pan/zoom
+                "fixedrange": True
             },
             "bargap": 0,
-            "dragmode": False  # fully static interaction (still allows clicks)
+            "dragmode": False
         }
     }
-    # Disable scroll zoom + other interactions that move axes
+    # Disable all default interactions; we use custom JS for this.
     graph_config = {
         "displayModeBar": False,
         "scrollZoom": False,
         "doubleClick": False,
-        "staticPlot": False  # keep False so click events still fire
+        "staticPlot": False  # Must be False for events to fire
     }
     return dcc.Graph(
         id={"type":"album-graph","album":album_id},
@@ -787,43 +777,6 @@ def manage_search_modal(is_open, pathname):
     
     return dash.no_update
 
-
-# Set rating from graph clicks (snap to 0.1)
-@app.callback(
-    Output({"type":"album-graph","album":MATCH}, "figure"),
-    Output({"type":"album-state","album":MATCH}, "data"),
-    Input({"type":"album-graph","album":MATCH}, "clickData"),
-    State({"type":"album-graph","album":MATCH}, "figure"),
-    State({"type":"album-state","album":MATCH}, "data"),
-    prevent_initial_call=True
-)
-def set_rating(click, fig, state):
-    if not click: return fig, state
-    album_id = callback_context.outputs_list[0]["id"]["album"]  # MATCH
-    ensure_rating_struct(album_id)
-    alb = ALBUMS[album_id]
-    # state may be None for first-time load when album had no keys.
-    if state is None:
-        ensure_rating_struct(album_id)
-        state = RATINGS[album_id]
-    R = state["ratings"]; I = state["ignored"]
-
-    point = click["points"][0]
-    # For bar trace clicks we still get integer y (height). For overlay scatter we have fine-grained y.
-    x_ix = int(point["x"]) - 1
-    raw_y = float(point.get("y", 0))
-    yval = max(0.0, min(10.0, raw_y))
-    yval = round(yval*10)/10.0  # snap 0.1
-    if not I[x_ix]:
-        R[x_ix] = yval
-
-    # write-thru
-    RATINGS[album_id] = {"ratings":R, "ignored":I}
-    _write_back_album(album_id)  # first mutation persists keys inline
-
-    # update figure y
-    fig["data"][0]["y"][x_ix] = 0 if (I[x_ix] or R[x_ix] is None) else R[x_ix]
-    return fig, RATINGS[album_id]
 
 # Toggle ignore buttons
 @app.callback(
