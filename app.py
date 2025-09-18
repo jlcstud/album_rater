@@ -488,6 +488,10 @@ def album_graph(album_id:str, theme:Dict):
 
     x = list(range(1, len(alb["tracks"])+1))
     y = [r if (r is not None and not I[i]) else 0 for i,r in enumerate(R)]
+    customdata = []
+    for i, rating in enumerate(R):
+        stored = None if rating is None else float(rating)
+        customdata.append([i, int(I[i]), stored])
 
     # labels inside bars (vertical)
     texts = []
@@ -515,7 +519,7 @@ def album_graph(album_id:str, theme:Dict):
                 "textangle": 90,
                 "insidetextanchor": "start",
                 "cliponaxis": False,
-                "customdata": [[i, int(I[i])] for i in range(len(x))]
+                "customdata": customdata
             }
         ],
         "layout": {
@@ -792,10 +796,9 @@ def toggle_ignore(n_clicks_list, state, fig):
     album_id = callback_context.outputs_list[0]["id"]["album"]
     ensure_rating_struct(album_id)
     alb = ALBUMS[album_id]
-    if state is None:
-        ensure_rating_struct(album_id)
-        state = RATINGS[album_id]
-    I = state["ignored"]; R = state["ratings"]
+    current = RATINGS[album_id]
+    I = list(current["ignored"])
+    R = list(current["ratings"])
     triggered = [p["prop_id"] for p in callback_context.triggered]
     if triggered and ".n_clicks" in triggered[0]:
         # find which button toggled
@@ -809,28 +812,48 @@ def toggle_ignore(n_clicks_list, state, fig):
     fig["data"][0]["marker"]["color"] = [main if not I[i] else "#4c4f58" for i in range(len(I))]
     fig["data"][0]["marker"]["line"]["color"] = ["#8fd4ff" if not I[i] else "#3a3d44" for i in range(len(I))]
     fig["data"][0]["y"] = [0 if (I[i] or R[i] is None) else R[i] for i in range(len(I))]
+    fig["data"][0]["customdata"] = [
+        [i, int(I[i]), None if R[i] is None else float(R[i])] for i in range(len(I))
+    ]
 
     RATINGS[album_id] = {"ratings":R, "ignored":I}
     _write_back_album(album_id)
     return RATINGS[album_id], colors, fig
 
+
+@server.route("/api/rate", methods=["POST"])
+def api_rate():
+    data = request.get_json(force=True) or {}
+    album_id = data.get("album_id")
+    ratings = data.get("ratings")
+    ignored = data.get("ignored")
+    if not album_id or album_id not in ALBUMS:
+        return jsonify({"ok": False, "error": "bad album_id"}), 400
+
+    ensure_rating_struct(album_id)
+    cur = RATINGS[album_id]
+
+    if isinstance(ratings, list) and len(ratings) == len(cur["ratings"]):
+        sanitized = []
+        for v in ratings:
+            if v is None:
+                sanitized.append(None)
+            else:
+                try:
+                    num = float(v)
+                except (TypeError, ValueError):
+                    num = 0.0
+                num = max(0.0, min(10.0, num))
+                sanitized.append(round(num * 10) / 10.0)
+        cur["ratings"] = sanitized
+
+    if isinstance(ignored, list) and len(ignored) == len(cur["ignored"]):
+        cur["ignored"] = [bool(x) for x in ignored]
+
+    RATINGS[album_id] = cur
+    _write_back_album(album_id)
+    return jsonify({"ok": True, "state": cur})
+
+
 if __name__ == "__main__":
-    # Simple API to update ratings via JS drag interactions
-    @server.route('/api/rate', methods=['POST'])
-    def api_rate():
-        data = request.get_json(force=True) or {}
-        album_id = data.get('album_id')
-        ratings = data.get('ratings')
-        ignored = data.get('ignored')
-        if not album_id or album_id not in ALBUMS:
-            return jsonify({'ok': False, 'error': 'bad album_id'}), 400
-        ensure_rating_struct(album_id)
-        cur = RATINGS[album_id]
-        if isinstance(ratings, list) and len(ratings)==len(cur['ratings']):
-            cur['ratings'] = [None if v is None else float(max(0,min(10,v))) for v in ratings]
-        if isinstance(ignored, list) and len(ignored)==len(cur['ignored']):
-            cur['ignored'] = [bool(x) for x in ignored]
-        RATINGS[album_id] = cur
-        _write_back_album(album_id)
-        return jsonify({'ok': True})
     app.run_server(debug=True)
