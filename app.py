@@ -12,13 +12,18 @@ from PIL import Image
 from scipy.ndimage import gaussian_filter
 from sklearn.cluster import KMeans
 import dash
-from dash import Dash, html, dcc, Input, Output, State, MATCH, ALL, callback_context
+from dash import Dash, html, dcc, Input, Output, State, MATCH, ALL, callback_context, no_update
 import dash_bootstrap_components as dbc
+from dash_extensions import EventListener
+from dash_svg import Svg, Line, Text, Rect, Polyline, Polygon
+import time
+from bisect import bisect_right
 
 # --------- Config / Paths ----------
 DATA_DIR = Path("output_spotify")         # where albums.json & images/ live
-JSON_PATH = DATA_DIR / "albums.json"      # will now also hold ratings inline
-# Removed separate ratings.json – ratings & ignored arrays now stored per album object.
+JSON_PATH = DATA_DIR / "albums.json"      # static album metadata
+RATINGS_DIR = DATA_DIR / "ratings"        # per-album lightweight rating files
+RATINGS_DIR.mkdir(parents=True, exist_ok=True)
 
 THUMB_DIR = DATA_DIR / "thumbs"
 THUMB_DIR.mkdir(parents=True, exist_ok=True)
@@ -175,55 +180,49 @@ albums_doc = load_json(JSON_PATH)
 ALBUMS: Dict[str,dict] = {a["album_id"]: a for a in albums_doc.get("albums", [])}
 ALL_ALBUMS = list(ALBUMS.values())
 
-# Ratings are embedded per-album under optional keys:
-#   album["ratings"]: list of length == len(tracks) with float|None
-#   album["ignored"]: list of bool of same length
-# We keep a transient RATINGS mirror for minimal changes to rest of code, but
-# it lazily reads from ALBUMS when accessed and writes back to albums.json.
 RATINGS: Dict[str,dict] = {}
 
-def _persist_albums_inline():
-    """Write ALBUMS (with any inline ratings/ignored) back to albums.json.
-    Keeps non-album top-level metadata from original document if present."""
-    # Reconstruct the original document shape
-    doc = albums_doc.copy()
-    # Replace the albums list with updated album dicts from ALBUMS (preserving order of original list)
-    ordered = []
-    for a in albums_doc.get("albums", []):
-        aid = a.get("album_id")
-        if aid in ALBUMS:
-            ordered.append(ALBUMS[aid])
-    # Include any albums that might have been added dynamically (unlikely here)
-    existing_ids = {a["album_id"] for a in ordered}
-    for aid, a in ALBUMS.items():
-        if aid not in existing_ids:
-            ordered.append(a)
-    doc["albums"] = ordered
-    save_json(JSON_PATH, doc)
+def rating_file(album_id:str) -> Path:
+    return RATINGS_DIR / f"{album_id}.json"
+
+def load_album_ratings(album_id:str, n_tracks:int) -> Tuple[list,list]:
+    path = rating_file(album_id)
+    if path.exists():
+        try:
+            data = load_json(path)
+            r = data.get("ratings")
+            ig = data.get("ignored")
+            if isinstance(r, list) and isinstance(ig, list) and len(r)==n_tracks and len(ig)==n_tracks:
+                return r, ig
+        except Exception:
+            pass
+    # fallback legacy inline
+    alb = ALBUMS[album_id]
+    r_inline = alb.get("ratings")
+    ig_inline = alb.get("ignored")
+    if isinstance(r_inline, list) and isinstance(ig_inline, list) and len(r_inline)==n_tracks and len(ig_inline)==n_tracks:
+        return r_inline, ig_inline
+    return [None]*n_tracks, [False]*n_tracks
+
+def save_album_ratings(album_id:str):
+    st = RATINGS[album_id]
+    path = rating_file(album_id)
+    tmp = path.with_suffix('.tmp')
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump({"ratings": st["ratings"], "ignored": st["ignored"]}, f, ensure_ascii=False)
+    tmp.replace(path)
 
 def ensure_rating_struct(album_id:str):
-    """Ensure RATINGS mirror has proper shape, lazily reading from album.
-    If album lacks keys, treat as all None / all False but DON'T persist until
-    the first user modification (dynamic behavior)."""
     alb = ALBUMS[album_id]
     n = len(alb["tracks"])
-    if album_id not in RATINGS or len(RATINGS[album_id].get("ratings", [])) != n:
-        # Pull existing if present & length matches; else synthesize ephemeral
-        r = alb.get("ratings")
-        ig = alb.get("ignored")
-        if not isinstance(r, list) or len(r) != n:
-            r = [None]*n
-        if not isinstance(ig, list) or len(ig) != n:
-            ig = [False]*n
+    if album_id not in RATINGS:
+        r, ig = load_album_ratings(album_id, n)
+        if len(r)!=n: r = [None]*n
+        if len(ig)!=n: ig = [False]*n
         RATINGS[album_id] = {"ratings": r, "ignored": ig}
 
 def _write_back_album(album_id:str):
-    """Write the in-memory RATINGS mirror for a single album back inline and persist."""
-    alb = ALBUMS[album_id]
-    state = RATINGS[album_id]
-    alb["ratings"] = state["ratings"]
-    alb["ignored"] = state["ignored"]
-    _persist_albums_inline()
+    save_album_ratings(album_id)
 
 def rated_album_mean(album_id:str) -> Tuple[float,float,int]:
     """Return (mean, duration-weighted mean, count_used) excluding ignored and None."""
@@ -328,8 +327,7 @@ def search_library(query:str) -> List[dict]:
     return results
 
 # --------- Dash App ----------
-app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY], suppress_callback_exceptions=True,
-           external_scripts=["/assets/drag.js"])
+app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY], suppress_callback_exceptions=True)
 server = app.server
 from flask import request, jsonify
 
@@ -388,11 +386,13 @@ def home_stats(theme):
     avg_len_min = round(np.mean([album_duration_ms(a)/60000 for a in ALL_ALBUMS]), 2) if n_albums else 0
     avg_tracks = round(np.mean([len(a["tracks"]) for a in ALL_ALBUMS]), 2) if n_albums else 0
     total_rated = 0
+    # Ensure RATINGS loaded for each album on demand
     for a in ALL_ALBUMS:
         aid = a["album_id"]
-        # treat missing as all None
-        rs = a.get("ratings") or []
-        total_rated += sum(1 for v in rs if v is not None)
+        ensure_rating_struct(aid)
+        rs = RATINGS[aid]["ratings"]
+        igs = RATINGS[aid]["ignored"]
+        total_rated += sum(1 for v,ig in zip(rs,igs) if v is not None and not ig)
     avg_album_rating = np.nan
     means = []
     for aid in ALBUMS.keys():
@@ -480,75 +480,154 @@ def layout_search(results:List[dict]):
         ], fluid=True)
     ])
 
-def album_graph(album_id:str, theme:Dict):
+###############################
+# SVG Rating Component Helpers
+###############################
+
+SVG_W, SVG_H = 700, 460
+MARGIN_L, MARGIN_R, MARGIN_T, MARGIN_B = 60, 20, 80, 52
+PLOT_W = SVG_W - MARGIN_L - MARGIN_R
+PLOT_H = SVG_H - MARGIN_T - MARGIN_B
+Y_MIN, Y_MAX = 0.0, 10.0
+MAX_UPS = 20
+MIN_INTERVAL = 1.0 / MAX_UPS
+
+LISTEN_EVENTS = [
+    {"event": "pointerdown",  "props": ["type", "offsetX", "offsetY", "buttons"]},
+    {"event": "pointermove",  "props": ["type", "offsetX", "offsetY", "buttons"]},
+    {"event": "pointerup",    "props": ["type", "offsetX", "offsetY", "buttons"]},
+    {"event": "pointerleave", "props": ["type", "offsetX", "offsetY", "buttons"]},
+]
+
+def _build_geometry(widths: list):
+    import numpy as _np
+    w = _np.asarray(widths, float)
+    n = len(w)
+    lefts = _np.empty(n, float)
+    rights = _np.empty(n, float)
+    lefts[0] = -w[0]/2.0
+    rights[0] = lefts[0] + w[0]
+    for i in range(1,n):
+        lefts[i] = rights[i-1]
+        rights[i] = lefts[i] + w[i]
+    centers = 0.5*(lefts+rights)
+    return lefts[0], rights[-1], lefts, rights, centers
+
+def _x_to_px(x, domain_l, domain_r):
+    return MARGIN_L + (x - domain_l) * (PLOT_W / (domain_r - domain_l))
+
+def _y_to_px(y):
+    return MARGIN_T + (Y_MAX - y) * (PLOT_H / (Y_MAX - Y_MIN))
+
+
+def _render_svg_children(album_id:str, ratings:list, ignored:list, widths:list, track_titles:list, theme:Dict):
+    import numpy as _np
+    domain_l, domain_r, LEFTS, RIGHTS, CENTERS = _build_geometry(widths)
+    elems = []
+    # y grid
+    for v in range(int(Y_MIN), int(Y_MAX)+1):
+        y = _y_to_px(v)
+        elems += [
+            Line(x1=MARGIN_L, y1=y, x2=MARGIN_L+PLOT_W, y2=y,
+                 stroke="#334955", strokeWidth=1, style={"pointerEvents":"none", "opacity":0.35}),
+            Text(str(v), x=MARGIN_L-10, y=y+4, fill="#9fb3bf", textAnchor="end", style={"fontSize":"12px", "pointerEvents":"none"}),
+        ]
+    # bottom indices only
+    for i in range(len(ratings)):
+        cx = _x_to_px((LEFTS[i]+RIGHTS[i])/2.0, domain_l, domain_r)
+        elems.append(Text(str(i+1), x=cx, y=MARGIN_T+PLOT_H+20, fill="#9fb3bf", textAnchor="middle", style={"fontSize":"12px", "pointerEvents":"none"}))
+    # We'll add separators after bars so they render on top.
+    accent = theme["accents"][0]
+    # independent bar rectangles & numeric labels
+    for i,(r,ign) in enumerate(zip(ratings, ignored)):
+        # Visual states:
+        #  - Ignored: very transparent (alpha ~0.33), treat value at actual rating (or 0) but display very faint.
+        #  - Null (unrated): show placeholder bar up to 5.0 with 0.5 alpha accent.
+        #  - Normal rated: full accent.
+        val = 5.0 if r is None else r
+        left = LEFTS[i]; right = RIGHTS[i]
+        cx = (left+right)/2.0
+        bar_x = _x_to_px(left, domain_l, domain_r)
+        bar_x2 = _x_to_px(right, domain_l, domain_r)
+        bar_w = bar_x2 - bar_x
+        y_val = _y_to_px(val)
+        if r is None:
+            # constant dark grey with 0.5 opacity placeholder to 5.0
+            elems.append(Rect(x=bar_x, y=y_val, width=bar_w, height=(MARGIN_T+PLOT_H - y_val),
+                              fill="#44484d", stroke="none", strokeWidth=0, style={"fillOpacity":0.5}))
+        else:
+            fill_opacity = 0.33 if ign else 1.0
+            elems.append(Rect(x=bar_x, y=y_val, width=bar_w, height=(MARGIN_T+PLOT_H - y_val),
+                              fill=accent, stroke="none", strokeWidth=0, style={"fillOpacity":fill_opacity}))
+        if r is not None and not ign:
+            elems.append(Text(f"{r:.1f}", x=_x_to_px(cx, domain_l, domain_r), y=MARGIN_T-14, fill="#cbd6dd", textAnchor="middle", style={"fontSize":"12px", "pointerEvents":"none"}))
+    # rotated titles centered horizontally over each bar (after rotation becomes vertical). Our coords: center each bar.
+    y_base = MARGIN_T + PLOT_H - 6
+    for i, title in enumerate(track_titles):
+        title_disp = title[:48] + ".." if len(title) > 50 else title
+        cx = (LEFTS[i]+RIGHTS[i])/2.0
+        px_center = _x_to_px(cx, domain_l, domain_r)
+        # Align so pivot (bottom middle of bar) is left edge of text after rotation; vertically center glyphs via dominantBaseline
+        elems.append(Text(
+            title_disp,
+            x=px_center,
+            y=y_base,
+            fill="#000000",
+            textAnchor="start",
+            style={"fontSize":"16px", "fontWeight":"bold", "pointerEvents":"none", "dominantBaseline":"middle", "alignmentBaseline":"middle"},
+            transform=f"rotate(-90 {px_center} {y_base})"
+        ))
+    # border
+    elems.append(Rect(x=MARGIN_L, y=MARGIN_T, width=PLOT_W, height=PLOT_H, fill="none", stroke="#44606f", strokeWidth=2, style={"pointerEvents":"none"}))
+    # separators on top (full height)
+    for b in RIGHTS[:-1]:
+        px = _x_to_px(b, domain_l, domain_r)
+        elems.append(Line(x1=px, y1=MARGIN_T, x2=px, y2=MARGIN_T+PLOT_H, stroke="#000000", strokeWidth=2, style={"pointerEvents":"none", "opacity":0.85}))
+    # removed polygon & step curve for performance
+    return elems
+
+def _point_from_offsets(offsetX, offsetY, widths):
+    if offsetX is None or offsetY is None:
+        return None
+    import numpy as _np
+    px, py = float(offsetX), float(offsetY)
+    if not (MARGIN_L <= px <= MARGIN_L + PLOT_W and MARGIN_T <= py <= MARGIN_T + PLOT_H):
+        return None
+    domain_l, domain_r, LEFTS, RIGHTS, CENTERS = _build_geometry(widths)
+    from bisect import bisect_right as _br
+    idx = _br(RIGHTS.tolist(), domain_l + (px - MARGIN_L) * (domain_r - domain_l) / PLOT_W)
+    idx = min(max(idx,0), len(widths)-1)
+    rely = (py - MARGIN_T)/PLOT_H
+    y_val = Y_MAX - rely*(Y_MAX - Y_MIN)
+    return idx, float(min(max(y_val, Y_MIN), Y_MAX))
+
+def svg_rating_component(album_id:str, theme:Dict):
     alb = ALBUMS[album_id]
     ensure_rating_struct(album_id)
-    R = RATINGS[album_id]["ratings"]
-    I = RATINGS[album_id]["ignored"]
+    ratings = RATINGS[album_id]["ratings"]
+    ignored = RATINGS[album_id]["ignored"]
+    n = len(ratings)
+    weighted = [max(1.0, min(6.0, len(t["title"])/4)) for t in alb["tracks"]]
+    uniform = [1.0]*n
+    return html.Div([
+        dcc.Store(id={"type":"album-widths","album":album_id}, data={"mode":"weighted","weighted":weighted,"uniform":uniform}),
+        dcc.Store(id={"type":"album-ratings","album":album_id}, data=ratings),
+        dcc.Store(id={"type":"album-ignored","album":album_id}, data=ignored),
+        dcc.Store(id={"type":"album-theme","album":album_id}, data=theme),
+        EventListener(
+            id={"type":"album-events","album":album_id},
+            events=LISTEN_EVENTS,
+            logging=False,
+            children=Svg(
+                id={"type":"album-svg","album":album_id},
+                width=SVG_W, height=SVG_H,
+                viewBox=f"0 0 {SVG_W} {SVG_H}",
+                style={"background": DEFAULT_THEME["bg_dark"],"userSelect":"none","touchAction":"none","cursor":"crosshair"},
+                children=_render_svg_children(album_id, ratings, ignored, weighted, [t["title"] for t in alb["tracks"]], theme)
+            )
+        )
+    ])
 
-    x = list(range(1, len(alb["tracks"])+1))
-    y = [r if (r is not None and not I[i]) else 0 for i,r in enumerate(R)]
-
-    # labels inside bars (vertical)
-    texts = []
-    for t in alb["tracks"]:
-        s = t["title"]
-        s = s[:20]  # truncate
-        texts.append(s.upper())
-
-    # Colors: use accent[0] for active, greys for ignored
-    main = theme["accents"][0]
-    colors = [main if not I[i] else "#4c4f58" for i in range(len(x))]
-    lines = ["#8fd4ff" if not I[i] else "#3a3d44" for i in range(len(x))]
-
-    # Overlay scatter points (transparent) to capture click position vertically.
-    # This is no longer needed with the new JS-based drag/click handler.
-
-    fig = {
-        "data": [
-            {
-                "type":"bar", "x": x, "y": y, "name":"Ratings",
-                "marker": {"color": colors, "line":{"width":2.5, "color": lines}},
-                "hoverinfo": "skip",
-                "text": texts,
-                "textposition": "inside",
-                "textangle": 90,
-                "insidetextanchor": "start",
-                "cliponaxis": False,
-                "customdata": [[i, int(I[i])] for i in range(len(x))]
-            }
-        ],
-        "layout": {
-            "uirevision": album_id,  # keep state on updates
-            "paper_bgcolor": DEFAULT_THEME["bg_superdark"],
-            "plot_bgcolor": DEFAULT_THEME["bg_dark"],
-            "font": {"color": DEFAULT_THEME["text"]},
-            "margin": {"l":50, "r":30, "t":20, "b":80},
-            "yaxis": {
-                "range":[0,10], "dtick":1, "gridcolor":"#2a2d33", "gridwidth":2,
-                "title":"Rating (0–10)",
-                "fixedrange": True
-            },
-            "xaxis": {
-                "showgrid": True, "gridcolor":"#22252b", "tickmode":"array",
-                "tickvals": x, "ticktext": x, "tickfont":{"size":12},
-                "fixedrange": True
-            },
-            "bargap": 0,
-            "dragmode": False
-        }
-    }
-    # Disable all default interactions; we use custom JS for this.
-    graph_config = {
-        "displayModeBar": False,
-        "scrollZoom": False,
-        "doubleClick": False,
-        "staticPlot": False  # Must be False for events to fire
-    }
-    return dcc.Graph(
-        id={"type":"album-graph","album":album_id},
-        figure=fig, config=graph_config, style={"height":"460px"}
-    )
 
 def album_ignore_strip(album_id:str, theme:Dict):
     alb = ALBUMS[album_id]
@@ -579,8 +658,8 @@ def layout_album(album_id:str):
 
     # right header with means
     stat_cards = dbc.Row([
-        dbc.Col(dbc.Card(dbc.CardBody([html.H6("Mean"), html.H3(mean if mean is not None else "—")])), md=4),
-        dbc.Col(dbc.Card(dbc.CardBody([html.H6("Duration-weighted"), html.H3(wmean if wmean is not None else "—")])), md=5),
+        dbc.Col(dbc.Card(dbc.CardBody([html.H6("Mean (Uniform)"), html.H3(mean if mean is not None else "—")])), md=4),
+        dbc.Col(dbc.Card(dbc.CardBody([html.H6("Mean (Duration)"), html.H3(wmean if wmean is not None else "—")])), md=5),
         dbc.Col(rank_block, md=3),
     ], className="gy-2")
 
@@ -607,10 +686,11 @@ def layout_album(album_id:str):
                 ], md=3),
                 dbc.Col([
                     stat_cards, html.Br(),
-                    album_graph(album_id, theme),
-                    html.Div("Click or drag across bars to rate (snap 0.1).", className="muted mb-2"),
+                    svg_rating_component(album_id, theme),
+                    html.Div("Click a bar to set rating; ignored tracks are grey and excluded from stats.", className="muted mb-2"),
                     html.Div("Click a number to ignore/include a track:", className="muted"),
                     album_ignore_strip(album_id, theme),
+                    dbc.Button("Toggle Bar Widths", id={"type":"width-toggle","album":album_id}, color="secondary", size="sm", className="mt-2"),
                     dcc.Store(id={"type":"album-state","album":album_id}, data=RATINGS.get(album_id))
                 ], md=9)
             ])
@@ -778,59 +858,116 @@ def manage_search_modal(is_open, pathname):
     return dash.no_update
 
 
-# Toggle ignore buttons
+###############################
+# New Callbacks for SVG rating
+###############################
+
 @app.callback(
-    Output({"type":"album-state","album":MATCH}, "data", allow_duplicate=True),
-    Output({"type":"ignore-btn","album":MATCH,"ix":ALL}, "color"),
-    Output({"type":"album-graph","album":MATCH}, "figure", allow_duplicate=True),
-    Input({"type":"ignore-btn","album":MATCH,"ix":ALL}, "n_clicks"),
-    State({"type":"album-state","album":MATCH}, "data"),
-    State({"type":"album-graph","album":MATCH}, "figure"),
+    Output({"type":"album-widths","album":MATCH}, "data"),
+    Input({"type":"width-toggle","album":MATCH}, "n_clicks"),
+    State({"type":"album-widths","album":MATCH}, "data"),
     prevent_initial_call=True
 )
-def toggle_ignore(n_clicks_list, state, fig):
-    album_id = callback_context.outputs_list[0]["id"]["album"]
+def toggle_width_mode(n_clicks, data):
+    if not callback_context.triggered:
+        return dash.no_update
+    if not data:
+        return dash.no_update
+    mode = data.get("mode","weighted")
+    data["mode"] = "uniform" if mode == "weighted" else "weighted"
+    return data
+
+@app.callback(
+    Output({"type":"album-ignored","album":MATCH}, "data", allow_duplicate=True),
+    Output({"type":"ignore-btn","album":MATCH,"ix":ALL}, "color"),
+    Output({"type":"album-svg","album":MATCH}, "children", allow_duplicate=True),
+    Input({"type":"ignore-btn","album":MATCH,"ix":ALL}, "n_clicks"),
+    State({"type":"album-ratings","album":MATCH}, "data"),
+    State({"type":"album-ignored","album":MATCH}, "data"),
+    State({"type":"album-widths","album":MATCH}, "data"),
+    State({"type":"album-theme","album":MATCH}, "data"),
+    prevent_initial_call=True
+)
+def toggle_ignore(n_clicks_list, ratings_state, ignored_state, widths_state, theme_state):
+    if not callback_context.triggered:
+        return dash.no_update, dash.no_update, dash.no_update
+    trig = dash.callback_context.triggered_id
+    album_id = trig.get("album") if isinstance(trig, dict) else None
+    if album_id is None:
+        return dash.no_update, dash.no_update, dash.no_update
     ensure_rating_struct(album_id)
     alb = ALBUMS[album_id]
-    if state is None:
-        ensure_rating_struct(album_id)
-        state = RATINGS[album_id]
-    I = state["ignored"]; R = state["ratings"]
-    triggered = [p["prop_id"] for p in callback_context.triggered]
-    if triggered and ".n_clicks" in triggered[0]:
-        # find which button toggled
-        btn_id = dash.callback_context.triggered_id
-        i = btn_id["ix"]
-        I[i] = not I[i]
-    # update colors for buttons
-    colors = ["secondary" if not I[i] else "dark" for i in range(len(I))]
-    # update fig colors and y-values
-    main = DEFAULT_THEME["accents"][0]
-    fig["data"][0]["marker"]["color"] = [main if not I[i] else "#4c4f58" for i in range(len(I))]
-    fig["data"][0]["marker"]["line"]["color"] = ["#8fd4ff" if not I[i] else "#3a3d44" for i in range(len(I))]
-    fig["data"][0]["y"] = [0 if (I[i] or R[i] is None) else R[i] for i in range(len(I))]
-
-    RATINGS[album_id] = {"ratings":R, "ignored":I}
+    # Use authoritative RATINGS structure for ratings, merge with store state to be safe.
+    current = RATINGS[album_id]
+    R = list(current["ratings"]) if ratings_state is None else list(ratings_state)
+    I = list(current["ignored"]) if ignored_state is None else list(ignored_state)
+    if trig and "ix" in trig:
+        i = trig["ix"]
+        if 0 <= i < len(I):
+            I[i] = not I[i]
+    RATINGS[album_id]["ratings"] = R  # preserve existing ratings
+    RATINGS[album_id]["ignored"] = I
     _write_back_album(album_id)
-    return RATINGS[album_id], colors, fig
+    colors = ["secondary" if not I[i] else "dark" for i in range(len(I))]
+    mode = widths_state.get("mode","weighted") if widths_state else "weighted"
+    widths = widths_state.get(mode, [1.0]*len(R)) if widths_state else [1.0]*len(R)
+    theme = theme_state or theme_from_cover(Path(alb["cover_png"]))
+    children = _render_svg_children(album_id, R, I, widths, [t["title"] for t in alb["tracks"]], theme)
+    return I, colors, children
+
+@app.callback(
+    Output({"type":"album-ratings","album":MATCH}, "data"),
+    Output({"type":"album-svg","album":MATCH}, "children", allow_duplicate=True),
+    Input({"type":"album-events","album":MATCH}, "n_events"),
+    State({"type":"album-events","album":MATCH}, "event"),
+    State({"type":"album-ratings","album":MATCH}, "data"),
+    State({"type":"album-ignored","album":MATCH}, "data"),
+    State({"type":"album-widths","album":MATCH}, "data"),
+    State({"type":"album-theme","album":MATCH}, "data"),
+    prevent_initial_call=True
+)
+def handle_pointer(n_events, evt, ratings, ignored, widths_state, theme_state):
+    if not evt:
+        return ratings, no_update
+    trig = dash.callback_context.triggered_id
+    album_id = trig.get("album") if isinstance(trig, dict) else None
+    if album_id is None:
+        return ratings, no_update
+    widths_mode = widths_state.get("mode","weighted") if widths_state else "weighted"
+    widths = widths_state.get(widths_mode, [1.0]*len(ratings)) if widths_state else [1.0]*len(ratings)
+    res = _point_from_offsets(evt.get("offsetX"), evt.get("offsetY"), widths)
+    if evt.get("type") == "pointerdown" and res is not None:
+        idx, y_new = res
+        ratings = list(ratings)
+        ratings[idx] = round(y_new,1)
+        ensure_rating_struct(album_id)
+        RATINGS[album_id]["ratings"] = ratings
+        _write_back_album(album_id)
+        alb = ALBUMS[album_id]
+        theme = theme_state or theme_from_cover(Path(alb["cover_png"]))
+        children = _render_svg_children(album_id, ratings, ignored, widths, [t["title"] for t in alb["tracks"]], theme)
+        return ratings, children
+    return ratings, no_update
+
+@app.callback(
+    Output({"type":"album-svg","album":MATCH}, "children", allow_duplicate=True),
+    Input({"type":"album-widths","album":MATCH}, "data"),
+    State({"type":"album-ratings","album":MATCH}, "data"),
+    State({"type":"album-ignored","album":MATCH}, "data"),
+    State({"type":"album-theme","album":MATCH}, "data"),
+    prevent_initial_call=True
+)
+def update_widths(width_state, ratings, ignored, theme_state):
+    trig = dash.callback_context.triggered_id
+    album_id = trig.get("album") if isinstance(trig, dict) else None
+    if album_id is None:
+        return no_update
+    alb = ALBUMS[album_id]
+    mode = width_state.get("mode","weighted") if width_state else "weighted"
+    widths = width_state.get(mode, [1.0]*len(ratings)) if width_state else [1.0]*len(ratings)
+    theme = theme_state or theme_from_cover(Path(alb["cover_png"]))
+    children = _render_svg_children(album_id, ratings, ignored, widths, [t["title"] for t in alb["tracks"]], theme)
+    return children
 
 if __name__ == "__main__":
-    # Simple API to update ratings via JS drag interactions
-    @server.route('/api/rate', methods=['POST'])
-    def api_rate():
-        data = request.get_json(force=True) or {}
-        album_id = data.get('album_id')
-        ratings = data.get('ratings')
-        ignored = data.get('ignored')
-        if not album_id or album_id not in ALBUMS:
-            return jsonify({'ok': False, 'error': 'bad album_id'}), 400
-        ensure_rating_struct(album_id)
-        cur = RATINGS[album_id]
-        if isinstance(ratings, list) and len(ratings)==len(cur['ratings']):
-            cur['ratings'] = [None if v is None else float(max(0,min(10,v))) for v in ratings]
-        if isinstance(ignored, list) and len(ignored)==len(cur['ignored']):
-            cur['ignored'] = [bool(x) for x in ignored]
-        RATINGS[album_id] = cur
-        _write_back_album(album_id)
-        return jsonify({'ok': True})
     app.run_server(debug=True)
