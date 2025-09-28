@@ -103,3 +103,13 @@ a, a:link, a:visited { outline: 1px solid rgba(255,0,0,0.5); }
   background: #15171c; font-size: 1.25rem; font-weight: 700; color: #dfe2e7;
 }
 .ignore-pill { border-radius: 6px; }
+
+/* Rank table styling */
+.rank-card { background:#15171c; border:1px solid #2a2d33; }
+.rank-table { width:100%; font-size:0.9rem; }
+.rank-table th { border-bottom:1px solid #2a2d33; font-weight:600; padding:2px 6px; }
+.rank-table td { border-bottom:1px solid #2a2d33; padding:2px 6px; }
+.rank-table tr:last-child td { border-bottom:none; }
+
+/* Accent color bar under album metadata */
+.accent-bar { box-shadow: 0 0 0 1px #0e0f12 inset; }

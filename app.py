@@ -156,23 +156,55 @@ def dominant_colors(img, n=5, std=0.0):
     return colors
 
 def theme_from_cover(cover_png: Path) -> Dict:
-    # Try to get 5 bright-ish colors from cover; fallback to default accents
+    """Derive theme from cover art.
+
+        Logic:
+            - Keep all 5 clustered colors (ordered) in th['accents_bar'].
+            - Valid colors: luminance > 0.25 (threshold updated from 0.30).
+            - Preferred primary: the first VALID color whose saturation > 0.5 (HSV S component).
+            - If no valid color has saturation > 0.5, choose the first valid color (most dominant passing luminance).
+            - If no colors pass luminance, fall back to DEFAULT_THEME accents (but still expose raw bar colors if present).
+            - Build th['accents'] starting with chosen primary followed by remaining distinct colors.
+    """
+    th = DEFAULT_THEME.copy()
     try:
         img = Image.open(cover_png).convert("RGB")
         arr = np.array(img.resize((128,128)))
-        cols = dominant_colors(arr)
-        good = []
-        for c in cols:
-            if luminance(c) > 0.35:   # reject too dark
-                good.append("#%02x%02x%02x" % tuple(int(v) for v in c))
-        if len(good) < 3:
-            accents = DEFAULT_THEME["accents"]
+        cols = dominant_colors(arr)  # ndarray shape (5,3)
+        # Convert all to hex (keep all 5 regardless of brightness)
+        bar_hex = ["#%02x%02x%02x" % tuple(int(v) for v in c) for c in cols]
+        # Helper saturation (avoid importing colorsys for tiny calc)
+        def _sat(carr):
+            r,g,b = [x/255.0 for x in carr]
+            mx = max(r,g,b); mn = min(r,g,b)
+            if mx == 0: return 0.0
+            return (mx - mn)/mx
+        valid = []  # (index, color_array, hex, sat)
+        for idx,c in enumerate(cols):
+            if luminance(c) > 0.25:
+                valid.append((idx, c, bar_hex[idx], _sat(c)))
+        primary = None
+        # First try: first valid with saturation > 0.5
+        for idx,c,hx,sat in valid:
+            if sat > 0.5:
+                primary = hx
+                break
+        # Fallback: first valid regardless of saturation
+        if primary is None and valid:
+            primary = valid[0][2]
+        if primary is None:
+            # fallback fully
+            th["accents"] = DEFAULT_THEME["accents"]
+            th["accents_bar"] = bar_hex if bar_hex else DEFAULT_THEME["accents"]
         else:
-            accents = good[:5]
+            # Build accents starting with primary then remaining unique colors (preserve order but skip duplicate primary)
+            remaining = [h for h in bar_hex if h != primary]
+            accents = [primary] + remaining
+            th["accents"] = accents[:5]
+            th["accents_bar"] = bar_hex
     except Exception:
-        accents = DEFAULT_THEME["accents"]
-    th = DEFAULT_THEME.copy()
-    th["accents"] = accents
+        th["accents"] = DEFAULT_THEME["accents"]
+        th["accents_bar"] = DEFAULT_THEME["accents"]
     return th
 
 # --------- Data loading / indexing ----------
@@ -253,6 +285,45 @@ def overall_rank(album_id:str, key="mean") -> Tuple[int,int]:
     idx = next((i for i,(aid,_) in enumerate(scores) if aid==album_id), None)
     if idx is None: return (None, len(scores))
     return (idx+1, len(scores))
+
+def compute_album_rank_table(target_album_id:str) -> Dict[str,Tuple[int,int]]:
+    """Compute rank positions for an album across different averaging schemes.
+
+    Returns a dict mapping label -> (rank, total) where label in
+    {"uniform", "duration", "artist"}. The 'artist' metric is defined as
+    the average of uniform and duration means: 0.5*uniform + 0.5*duration.
+
+    Only albums with at least one rated (non-ignored) track are included in
+    denominators.
+    """
+    # Build global rows for uniform & duration based rankings
+    rows = []  # (album_id, uniform_mean, duration_mean, artist_combo)
+    for aid, alb in ALBUMS.items():
+        mean_u, mean_dur, cnt = rated_album_mean(aid)
+        if cnt > 0 and mean_u is not None and mean_dur is not None:
+            artist_metric = 0.5*mean_u + 0.5*mean_dur
+            rows.append((aid, mean_u, mean_dur, artist_metric, alb["artists"]))
+
+    def build_rank_map(get_score, subset=None):
+        iterable = rows if subset is None else [r for r in rows if r[0] in subset]
+        ordered = sorted(((aid, get_score(aid, u, d, artm)) for aid,u,d,artm,_artists in iterable), key=lambda x: x[1], reverse=True)
+        total = len(ordered)
+        return {aid: (i+1, total) for i,(aid,_) in enumerate(ordered)}
+
+    # Collect albums by (normalized) artist key; if multiple artists string, we treat the entire string as bucket for simplicity.
+    # (Could be refined later to split on commas.)
+    target_album = ALBUMS.get(target_album_id)
+    target_artist_key = target_album["artists"] if target_album else None
+    same_artist_ids = {aid for aid, *_rest in rows if ALBUMS[aid]["artists"] == target_artist_key}
+
+    uniform_ranks = build_rank_map(lambda aid,u,d,artm: u)
+    duration_ranks = build_rank_map(lambda aid,u,d,artm: d)
+    artist_ranks = build_rank_map(lambda aid,u,d,artm: artm, subset=same_artist_ids)
+    return {
+        "uniform": uniform_ranks.get(target_album_id, (None, len(uniform_ranks))),
+        "duration": duration_ranks.get(target_album_id, (None, len(duration_ranks))),
+        "artist": artist_ranks.get(target_album_id, (None, len(artist_ranks))),
+    }
 
 # Search index
 def build_search_index():
@@ -607,7 +678,24 @@ def svg_rating_component(album_id:str, theme:Dict):
     ratings = RATINGS[album_id]["ratings"]
     ignored = RATINGS[album_id]["ignored"]
     n = len(ratings)
-    weighted = [max(1.0, min(6.0, len(t["title"])/4)) for t in alb["tracks"]]
+    # --- Duration-based bar widths (simplified) ---
+    # Goal: widths proportional to track duration so horizontal axis reflects time.
+    # Only adjustment: enforce a 30s minimum so ultra-short tracks remain clickable.
+    # No upper cap, no compression.
+    def _compute_duration_widths(tracks):
+        secs = []
+        for tr in tracks:
+            d_ms = tr.get("duration_ms") or 0
+            secs.append(d_ms/1000.0)
+        if not secs:
+            return [1.0]*len(tracks)
+        adj = [max(30.0, s) for s in secs]
+        total = sum(adj)
+        if total <= 0:
+            return [1.0]*len(adj)
+        # Normalize so average width ~1.0 (sum = n)
+        return [a * len(adj) / total for a in adj]
+    weighted = _compute_duration_widths(alb["tracks"])
     uniform = [1.0]*n
     return html.Div([
         dcc.Store(id={"type":"album-widths","album":album_id}, data={"mode":"weighted","weighted":weighted,"uniform":uniform}),
@@ -642,6 +730,44 @@ def album_ignore_strip(album_id:str, theme:Dict):
         )
     return html.Div(btns, className="d-flex flex-wrap")
 
+def render_rank_card(album_id:str):
+    """Return a rank card component for the given album id (no callbacks)."""
+    rank_table = compute_album_rank_table(album_id)
+    def fmt(pair:Tuple[int,int]):
+        r, total = pair
+        return f"{r}/{total}" if r is not None and total else "—"
+    return dbc.Card(
+        dbc.CardBody([
+            html.Table([
+                html.Thead(html.Tr([html.Th("Type"), html.Th("Rank", style={"textAlign":"right"})])),
+                html.Tbody([
+                    html.Tr([html.Td("Uniform"), html.Td(fmt(rank_table["uniform"]), style={"textAlign":"right"})]),
+                    html.Tr([html.Td("Duration"), html.Td(fmt(rank_table["duration"]), style={"textAlign":"right"})]),
+                    html.Tr([html.Td("Artist"), html.Td(fmt(rank_table["artist"]), style={"textAlign":"right"})]),
+                ])
+            ], className="rank-table")
+        ]), className="rank-card", id={"type":"rank-card","album":album_id})
+
+def accent_color_bar(theme:Dict):
+    """Return a thick horizontal bar composed of 5 cover-derived colors.
+    Uses theme['accents_bar'] (raw clustered colors) falling back gracefully."""
+    cols = (theme.get("accents_bar") or theme.get("accents") or DEFAULT_THEME["accents"])[:5]
+    segs = []
+    width_pct = 100/len(cols) if cols else 100
+    for i,c in enumerate(cols):
+        segs.append(html.Div(style={
+            "flex":"1 1 auto",
+            "background":c,
+            "height":"28px"  # ~8x default hr thickness (approx 3-4px originally)
+        }))
+    return html.Div(segs, className="accent-bar", style={
+        "display":"flex",
+        "width":"100%",
+        "borderRadius":"6px",
+        "overflow":"hidden",
+        "margin":"18px 0 14px 0"
+    })
+
 def layout_album(album_id:str):
     alb = ALBUMS[album_id]
     theme = theme_from_cover(Path(alb["cover_png"]))
@@ -650,17 +776,12 @@ def layout_album(album_id:str):
     cover_big = image_to_data_uri(Path(alb["cover_png"]))
 
     mean, wmean, c = rated_album_mean(album_id)
-    rank, denom = overall_rank(album_id, key="wmean")
-    rank_block = html.Div([
-        html.Div("Rank", className="muted small"),
-        html.Div(f"{rank} / {denom}" if rank else "—", className="rank-box")
-    ], style={"textAlign":"right"})
+    rank_box = html.Div(id={"type":"rank-card-container","album":album_id}, children=[render_rank_card(album_id)])
 
-    # right header with means
     stat_cards = dbc.Row([
-        dbc.Col(dbc.Card(dbc.CardBody([html.H6("Mean (Uniform)"), html.H3(mean if mean is not None else "—")])), md=4),
-        dbc.Col(dbc.Card(dbc.CardBody([html.H6("Mean (Duration)"), html.H3(wmean if wmean is not None else "—")])), md=5),
-        dbc.Col(rank_block, md=3),
+        dbc.Col(dbc.Card(dbc.CardBody([html.H6("Mean (Uniform)"), html.H3(mean if mean is not None else "—", id={"type":"mean-uniform","album":album_id})])), md=4),
+        dbc.Col(dbc.Card(dbc.CardBody([html.H6("Mean (Duration)"), html.H3(wmean if wmean is not None else "—", id={"type":"mean-duration","album":album_id})])), md=4),
+        dbc.Col(rank_box, md=4),
     ], className="gy-2")
 
     tracks_table = dbc.Table(
@@ -682,7 +803,8 @@ def layout_album(album_id:str):
                     html.Img(src=cover_big, className="cover-big"),
                     html.H4(alb["album_name"]), html.Div(alb["artists"], className="muted"),
                     html.Div(alb.get("year",""), className="muted"),
-                    html.Hr(), tracks_table
+                    accent_color_bar(theme),
+                    tracks_table
                 ], md=3),
                 dbc.Col([
                     stat_cards, html.Br(),
@@ -690,8 +812,12 @@ def layout_album(album_id:str):
                     html.Div("Click a bar to set rating; ignored tracks are grey and excluded from stats.", className="muted mb-2"),
                     html.Div("Click a number to ignore/include a track:", className="muted"),
                     album_ignore_strip(album_id, theme),
-                    dbc.Button("Toggle Bar Widths", id={"type":"width-toggle","album":album_id}, color="secondary", size="sm", className="mt-2"),
-                    dcc.Store(id={"type":"album-state","album":album_id}, data=RATINGS.get(album_id))
+                    dbc.Button("Toggle Bar Widths", id={"type":"width-toggle","album":album_id}, color="secondary", size="sm", className="mt-2 me-2"),
+                    dbc.Button("Update Ranks", id={"type":"update-ranks","album":album_id}, color="secondary", size="sm", className="mt-2 me-2"),
+                    dbc.Button("Reset", id={"type":"reset-ratings","album":album_id}, color="danger", outline=True, size="sm", className="mt-2"),
+                    dcc.Store(id={"type":"album-state","album":album_id}, data=RATINGS.get(album_id)),
+                    # Store to hold a snapshot of ratings/ignored when Reset pressed; cleared on navigation or edits
+                    dcc.Store(id={"type":"reset-snapshot","album":album_id})
                 ], md=9)
             ])
         ], fluid=True)
@@ -968,6 +1094,190 @@ def update_widths(width_state, ratings, ignored, theme_state):
     theme = theme_state or theme_from_cover(Path(alb["cover_png"]))
     children = _render_svg_children(album_id, ratings, ignored, widths, [t["title"] for t in alb["tracks"]], theme)
     return children
+
+@app.callback(
+    Output({"type":"rank-card-container","album":MATCH}, "children"),
+    Output({"type":"mean-uniform","album":MATCH}, "children"),
+    Output({"type":"mean-duration","album":MATCH}, "children"),
+    Input({"type":"update-ranks","album":MATCH}, "n_clicks"),
+    prevent_initial_call=True
+)
+def update_ranks(n_clicks):
+    trig = dash.callback_context.triggered_id
+    album_id = trig.get("album") if isinstance(trig, dict) else None
+    if album_id is None:
+        return dash.no_update, dash.no_update, dash.no_update
+    # Recompute stats
+    mean, wmean, c = rated_album_mean(album_id)
+    mean_disp = mean if mean is not None else "—"
+    wmean_disp = wmean if wmean is not None else "—"
+    return [render_rank_card(album_id)], mean_disp, wmean_disp
+
+
+@app.callback(
+    Output({"type":"reset-ratings","album":MATCH}, "children"),
+    Output({"type":"reset-snapshot","album":MATCH}, "data"),
+    Output({"type":"album-ratings","album":MATCH}, "data", allow_duplicate=True),
+    Output({"type":"album-ignored","album":MATCH}, "data", allow_duplicate=True),
+    Output({"type":"album-svg","album":MATCH}, "children", allow_duplicate=True),
+    Input({"type":"reset-ratings","album":MATCH}, "n_clicks"),
+    State({"type":"reset-ratings","album":MATCH}, "children"),
+    State({"type":"album-ratings","album":MATCH}, "data"),
+    State({"type":"album-ignored","album":MATCH}, "data"),
+    State({"type":"album-widths","album":MATCH}, "data"),
+    State({"type":"album-theme","album":MATCH}, "data"),
+    prevent_initial_call=True
+)
+def reset_or_revert(n_clicks, current_label, ratings, ignored, widths_state, theme_state):
+    if not n_clicks:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    trig = dash.callback_context.triggered_id
+    album_id = trig.get("album") if isinstance(trig, dict) else None
+    if album_id is None:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    ensure_rating_struct(album_id)
+    # Acquire album metadata
+    alb = ALBUMS[album_id]
+    widths_mode = widths_state.get("mode","weighted") if widths_state else "weighted"
+    widths = widths_state.get(widths_mode, [1.0]*len(ratings)) if widths_state else [1.0]*len(ratings)
+    theme = theme_state or theme_from_cover(Path(alb["cover_png"]))
+
+    if current_label == "Reset":
+        # Snapshot original state PLUS the cleared state reference so we can distinguish initial cleared view from user edits.
+        new_ratings = [None for _ in ratings]
+        new_ignored = [False for _ in ignored]
+        snapshot = {
+            "original_ratings": list(ratings),
+            "original_ignored": list(ignored),
+            "cleared_ratings": list(new_ratings),
+            "cleared_ignored": list(new_ignored),
+            "ts": datetime.utcnow().isoformat()
+        }
+        # Persist cleared state
+        RATINGS[album_id]["ratings"] = new_ratings
+        RATINGS[album_id]["ignored"] = new_ignored
+        _write_back_album(album_id)
+        # Keep server-side snapshot for Revert action
+        _RESET_SNAPSHOTS[album_id] = snapshot
+        children = _render_svg_children(album_id, new_ratings, new_ignored, widths, [t["title"] for t in alb["tracks"]], theme)
+        return "Revert", snapshot, new_ratings, new_ignored, children
+    else:  # Revert
+        snap = _RESET_SNAPSHOTS.get(album_id)
+        if not snap:
+            return "Reset", dash.no_update, ratings, ignored, dash.no_update
+        # TTL check (5s)
+        try:
+            ts = datetime.fromisoformat(snap.get("ts"))
+            if (datetime.utcnow() - ts).total_seconds() > 5:
+                _RESET_SNAPSHOTS.pop(album_id, None)
+                return "Reset", None, ratings, ignored, dash.no_update
+        except Exception:
+            _RESET_SNAPSHOTS.pop(album_id, None)
+            return "Reset", None, ratings, ignored, dash.no_update
+        restored_ratings = list(snap["original_ratings"])
+        restored_ignored = list(snap["original_ignored"])
+        RATINGS[album_id]["ratings"] = restored_ratings
+        RATINGS[album_id]["ignored"] = restored_ignored
+        _write_back_album(album_id)
+        children = _render_svg_children(album_id, restored_ratings, restored_ignored, widths, [t["title"] for t in alb["tracks"]], theme)
+        _RESET_SNAPSHOTS.pop(album_id, None)
+        return "Reset", None, restored_ratings, restored_ignored, children
+
+# Ephemeral map for snapshots keyed by album id
+_RESET_SNAPSHOTS = {}
+
+# Modify reset_or_revert to handle Revert path with global snapshot
+def _reset_or_revert_impl(n_clicks, current_label, ratings, ignored, widths_state, theme_state):
+    trig = dash.callback_context.triggered_id
+    album_id = trig.get("album") if isinstance(trig, dict) else None
+    if album_id is None:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    alb = ALBUMS[album_id]
+    widths_mode = widths_state.get("mode","weighted") if widths_state else "weighted"
+    widths = widths_state.get(widths_mode, [1.0]*len(ratings)) if widths_state else [1.0]*len(ratings)
+    theme = theme_state or theme_from_cover(Path(alb["cover_png"]))
+    ensure_rating_struct(album_id)
+    if current_label == "Reset":
+        snap = {"ratings": list(ratings), "ignored": list(ignored), "ts": datetime.utcnow().isoformat()}
+        _RESET_SNAPSHOTS[album_id] = snap
+        new_ratings = [None for _ in ratings]
+        new_ignored = [False for _ in ignored]
+        RATINGS[album_id]["ratings"] = new_ratings
+        RATINGS[album_id]["ignored"] = new_ignored
+        _write_back_album(album_id)
+        children = _render_svg_children(album_id, new_ratings, new_ignored, widths, [t["title"] for t in alb["tracks"]], theme)
+        return "Revert", snap, new_ratings, new_ignored, children
+    else:  # Revert
+        snap = _RESET_SNAPSHOTS.get(album_id)
+        if not snap:
+            return "Reset", dash.no_update, ratings, ignored, dash.no_update
+        restored_ratings = list(snap["ratings"])
+        restored_ignored = list(snap["ignored"])
+        RATINGS[album_id]["ratings"] = restored_ratings
+        RATINGS[album_id]["ignored"] = restored_ignored
+        _write_back_album(album_id)
+        children = _render_svg_children(album_id, restored_ratings, restored_ignored, widths, [t["title"] for t in alb["tracks"]], theme)
+        # Clear snapshot after revert
+        _RESET_SNAPSHOTS.pop(album_id, None)
+        return "Reset", None, restored_ratings, restored_ignored, children
+
+# Rebind the decorated function to wrapper to include revert logic
+reset_or_revert.__wrapped__ = _reset_or_revert_impl  # type: ignore
+reset_or_revert = _reset_or_revert_impl  # type: ignore
+
+@app.callback(
+    Output({"type":"reset-ratings","album":MATCH}, "children", allow_duplicate=True),
+    Input({"type":"album-ratings","album":MATCH}, "data"),
+    Input({"type":"album-ignored","album":MATCH}, "data"),
+    State({"type":"reset-ratings","album":MATCH}, "children"),
+    prevent_initial_call=True
+)
+def guard_label_after_external_change(current_ratings, current_ignored, label):
+    """Keep 'Revert' label active ONLY while:
+       - A snapshot exists
+       - TTL (5s) not expired
+       - User has not modified ratings/ignored beyond the initial cleared state
+    Otherwise revert label to 'Reset'.
+    """
+    if label != "Revert":
+        return dash.no_update
+    trig = dash.callback_context.triggered_id
+    album_id = trig.get("album") if isinstance(trig, dict) else None
+    if album_id is None:
+        return dash.no_update
+    snap = _RESET_SNAPSHOTS.get(album_id)
+    if not snap:
+        return "Reset"
+    # TTL check
+    try:
+        ts = datetime.fromisoformat(snap.get("ts"))
+        if (datetime.utcnow() - ts).total_seconds() > 5:
+            _RESET_SNAPSHOTS.pop(album_id, None)
+            return "Reset"
+    except Exception:
+        _RESET_SNAPSHOTS.pop(album_id, None)
+        return "Reset"
+    # If user has begun editing (ratings differ from cleared_ratings OR ignored differ from cleared_ignored) invalidate
+    if current_ratings != snap.get("cleared_ratings") or current_ignored != snap.get("cleared_ignored"):
+        _RESET_SNAPSHOTS.pop(album_id, None)
+        return "Reset"
+    return dash.no_update
+
+@app.callback(
+    Output({"type":"reset-ratings","album":MATCH}, "children", allow_duplicate=True),
+    Input({"type":"album-events","album":MATCH}, "n_events"),
+    State({"type":"reset-ratings","album":MATCH}, "children"),
+    prevent_initial_call=True
+)
+def invalidate_snapshot_on_pointer(n_events, label):
+    if not n_events or label != "Revert":
+        return dash.no_update
+    trig = dash.callback_context.triggered_id
+    album_id = trig.get("album") if isinstance(trig, dict) else None
+    if album_id in _RESET_SNAPSHOTS:
+        # If a user changes a rating while in Revert mode, they are editing cleared state; keep ability to revert until they change value? Simpler: keep snapshot until revert or toggle ignore
+        pass
+    return dash.no_update
 
 if __name__ == "__main__":
     app.run_server(debug=True)
