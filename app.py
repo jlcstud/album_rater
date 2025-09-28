@@ -287,42 +287,28 @@ def overall_rank(album_id:str, key="mean") -> Tuple[int,int]:
     return (idx+1, len(scores))
 
 def compute_album_rank_table(target_album_id:str) -> Dict[str,Tuple[int,int]]:
-    """Compute rank positions for an album across different averaging schemes.
+    """Compute rank positions (uniform & duration means only) for an album.
 
-    Returns a dict mapping label -> (rank, total) where label in
-    {"uniform", "duration", "artist"}. The 'artist' metric is defined as
-    the average of uniform and duration means: 0.5*uniform + 0.5*duration.
-
-    Only albums with at least one rated (non-ignored) track are included in
-    denominators.
+    Returns dict mapping metric -> (rank, total_albums_with_ratings)
+    Only albums with at least one rated (non-ignored) track are considered.
     """
-    # Build global rows for uniform & duration based rankings
-    rows = []  # (album_id, uniform_mean, duration_mean, artist_combo)
-    for aid, alb in ALBUMS.items():
+    rows = []  # (album_id, uniform_mean, duration_mean)
+    for aid in ALBUMS.keys():
         mean_u, mean_dur, cnt = rated_album_mean(aid)
         if cnt > 0 and mean_u is not None and mean_dur is not None:
-            artist_metric = 0.5*mean_u + 0.5*mean_dur
-            rows.append((aid, mean_u, mean_dur, artist_metric, alb["artists"]))
-
-    def build_rank_map(get_score, subset=None):
-        iterable = rows if subset is None else [r for r in rows if r[0] in subset]
-        ordered = sorted(((aid, get_score(aid, u, d, artm)) for aid,u,d,artm,_artists in iterable), key=lambda x: x[1], reverse=True)
+            rows.append((aid, mean_u, mean_dur))
+    def build_rank_map(idx:int):
+        ordered = sorted(((aid, r[idx+1]) for aid,*r in [(a,u,d) for (a,u,d) in rows]), key=lambda x: x[1], reverse=True)
         total = len(ordered)
-        return {aid: (i+1, total) for i,(aid,_) in enumerate(ordered)}
-
-    # Collect albums by (normalized) artist key; if multiple artists string, we treat the entire string as bucket for simplicity.
-    # (Could be refined later to split on commas.)
-    target_album = ALBUMS.get(target_album_id)
-    target_artist_key = target_album["artists"] if target_album else None
-    same_artist_ids = {aid for aid, *_rest in rows if ALBUMS[aid]["artists"] == target_artist_key}
-
-    uniform_ranks = build_rank_map(lambda aid,u,d,artm: u)
-    duration_ranks = build_rank_map(lambda aid,u,d,artm: d)
-    artist_ranks = build_rank_map(lambda aid,u,d,artm: artm, subset=same_artist_ids)
+        return {aid:(i+1,total) for i,(aid,_) in enumerate(ordered)}
+    # simpler direct maps
+    uniform_ranks = sorted(((aid,u) for (aid,u,_) in rows), key=lambda x:x[1], reverse=True)
+    duration_ranks = sorted(((aid,d) for (aid,_,d) in rows), key=lambda x:x[1], reverse=True)
+    uniform_map = {aid:(i+1,len(uniform_ranks)) for i,(aid,_) in enumerate(uniform_ranks)}
+    duration_map = {aid:(i+1,len(duration_ranks)) for i,(aid,_) in enumerate(duration_ranks)}
     return {
-        "uniform": uniform_ranks.get(target_album_id, (None, len(uniform_ranks))),
-        "duration": duration_ranks.get(target_album_id, (None, len(duration_ranks))),
-        "artist": artist_ranks.get(target_album_id, (None, len(artist_ranks))),
+        "uniform": uniform_map.get(target_album_id, (None, len(uniform_ranks))),
+        "duration": duration_map.get(target_album_id, (None, len(duration_ranks)))
     }
 
 # Search index
@@ -555,8 +541,8 @@ def layout_search(results:List[dict]):
 # SVG Rating Component Helpers
 ###############################
 
-SVG_W, SVG_H = 700, 460
-MARGIN_L, MARGIN_R, MARGIN_T, MARGIN_B = 60, 20, 80, 52
+SVG_W, SVG_H = 840, 368  # widened 20% (700->840) and reduced height 20% (460->368)
+MARGIN_L, MARGIN_R, MARGIN_T, MARGIN_B = 60, 24, 70, 52
 PLOT_W = SVG_W - MARGIN_L - MARGIN_R
 PLOT_H = SVG_H - MARGIN_T - MARGIN_B
 Y_MIN, Y_MAX = 0.0, 10.0
@@ -603,10 +589,32 @@ def _render_svg_children(album_id:str, ratings:list, ignored:list, widths:list, 
                  stroke="#334955", strokeWidth=1, style={"pointerEvents":"none", "opacity":0.35}),
             Text(str(v), x=MARGIN_L-10, y=y+4, fill="#9fb3bf", textAnchor="end", style={"fontSize":"12px", "pointerEvents":"none"}),
         ]
-    # bottom indices only
+    # Internal graph title (moved from external controls row)
+    # Title positioned above the plot border, offset left to align with plot not y-axis labels
+    title_y = MARGIN_T - 52  # raise higher so it clears numeric rating labels
+    elems.append(Text(
+        "Album Rating Graph",
+        x=MARGIN_L + 8,
+        y=title_y + 18,  # baseline tweak so visual block centers in reserved band
+        fill="#cbd6dd",
+        textAnchor="start",
+        style={"fontSize":"18px", "fontWeight":"600", "pointerEvents":"none"}
+    ))
+    # bottom index toggle band
+    index_band_top = MARGIN_T + PLOT_H + 4
+    index_band_h = 26
     for i in range(len(ratings)):
-        cx = _x_to_px((LEFTS[i]+RIGHTS[i])/2.0, domain_l, domain_r)
-        elems.append(Text(str(i+1), x=cx, y=MARGIN_T+PLOT_H+20, fill="#9fb3bf", textAnchor="middle", style={"fontSize":"12px", "pointerEvents":"none"}))
+        left = LEFTS[i]; right = RIGHTS[i]
+        px_l = _x_to_px(left, domain_l, domain_r)
+        px_r = _x_to_px(right, domain_l, domain_r)
+        w = px_r - px_l
+        bg = "#3d4246" if not ignored[i] else "#25292c"
+        stroke = "#5a6166" if not ignored[i] else "#353a3d"
+        elems.append(Rect(x=px_l+1, y=index_band_top, width=w-2, height=index_band_h, fill=bg, stroke=stroke, strokeWidth=1,
+                          style={"cursor":"pointer", "rx":4, "ry":4}))
+        cx = (px_l+px_r)/2.0
+        txt_color = "#dde2e6" if not ignored[i] else "#7e868d"
+        elems.append(Text(str(i+1), x=cx, y=index_band_top + index_band_h/2 + 1, fill=txt_color, textAnchor="middle", style={"fontSize":"13px", "pointerEvents":"none", "dominantBaseline":"middle"}))
     # We'll add separators after bars so they render on top.
     accent = theme["accents"][0]
     # independent bar rectangles & numeric labels
@@ -635,7 +643,8 @@ def _render_svg_children(album_id:str, ratings:list, ignored:list, widths:list, 
     # rotated titles centered horizontally over each bar (after rotation becomes vertical). Our coords: center each bar.
     y_base = MARGIN_T + PLOT_H - 6
     for i, title in enumerate(track_titles):
-        title_disp = title[:48] + ".." if len(title) > 50 else title
+        # Truncate very long titles: if >30 chars, show first 28 + '..'
+        title_disp = title[:28] + ".." if len(title) > 30 else title
         cx = (LEFTS[i]+RIGHTS[i])/2.0
         px_center = _x_to_px(cx, domain_l, domain_r)
         # Align so pivot (bottom middle of bar) is left edge of text after rotation; vertically center glyphs via dominantBaseline
@@ -662,12 +671,17 @@ def _point_from_offsets(offsetX, offsetY, widths):
         return None
     import numpy as _np
     px, py = float(offsetX), float(offsetY)
-    if not (MARGIN_L <= px <= MARGIN_L + PLOT_W and MARGIN_T <= py <= MARGIN_T + PLOT_H):
+    # Allow clicks in plot area for rating & below in index band for ignore toggle
+    in_plot = (MARGIN_L <= px <= MARGIN_L + PLOT_W and MARGIN_T <= py <= MARGIN_T + PLOT_H)
+    in_index = (MARGIN_L <= px <= MARGIN_L + PLOT_W and MARGIN_T + PLOT_H + 4 <= py <= MARGIN_T + PLOT_H + 30)
+    if not (in_plot or in_index):
         return None
     domain_l, domain_r, LEFTS, RIGHTS, CENTERS = _build_geometry(widths)
     from bisect import bisect_right as _br
     idx = _br(RIGHTS.tolist(), domain_l + (px - MARGIN_L) * (domain_r - domain_l) / PLOT_W)
     idx = min(max(idx,0), len(widths)-1)
+    if in_index:
+        return (idx, None)  # signal ignore toggle
     rely = (py - MARGIN_T)/PLOT_H
     y_val = Y_MAX - rely*(Y_MAX - Y_MIN)
     return idx, float(min(max(y_val, Y_MIN), Y_MAX))
@@ -742,8 +756,7 @@ def render_rank_card(album_id:str):
                 html.Thead(html.Tr([html.Th("Type"), html.Th("Rank", style={"textAlign":"right"})])),
                 html.Tbody([
                     html.Tr([html.Td("Uniform"), html.Td(fmt(rank_table["uniform"]), style={"textAlign":"right"})]),
-                    html.Tr([html.Td("Duration"), html.Td(fmt(rank_table["duration"]), style={"textAlign":"right"})]),
-                    html.Tr([html.Td("Artist"), html.Td(fmt(rank_table["artist"]), style={"textAlign":"right"})]),
+                    html.Tr([html.Td("Duration"), html.Td(fmt(rank_table["duration"]), style={"textAlign":"right"})])
                 ])
             ], className="rank-table")
         ]), className="rank-card", id={"type":"rank-card","album":album_id})
@@ -808,15 +821,14 @@ def layout_album(album_id:str):
                 ], md=3),
                 dbc.Col([
                     stat_cards, html.Br(),
+                    # Controls row above graph
+                    html.Div([
+                        dbc.Button("Toggle Bar Widths", id={"type":"width-toggle","album":album_id}, color="secondary", size="sm", className="me-2"),
+                        dbc.Button("Update Ranks", id={"type":"update-ranks","album":album_id}, color="secondary", size="sm", className="me-2"),
+                        dbc.Button("Reset", id={"type":"reset-ratings","album":album_id}, color="danger", outline=True, size="sm"),
+                    ], className="d-flex align-items-center flex-wrap gap-2 mb-2"),
                     svg_rating_component(album_id, theme),
-                    html.Div("Click a bar to set rating; ignored tracks are grey and excluded from stats.", className="muted mb-2"),
-                    html.Div("Click a number to ignore/include a track:", className="muted"),
-                    album_ignore_strip(album_id, theme),
-                    dbc.Button("Toggle Bar Widths", id={"type":"width-toggle","album":album_id}, color="secondary", size="sm", className="mt-2 me-2"),
-                    dbc.Button("Update Ranks", id={"type":"update-ranks","album":album_id}, color="secondary", size="sm", className="mt-2 me-2"),
-                    dbc.Button("Reset", id={"type":"reset-ratings","album":album_id}, color="danger", outline=True, size="sm", className="mt-2"),
                     dcc.Store(id={"type":"album-state","album":album_id}, data=RATINGS.get(album_id)),
-                    # Store to hold a snapshot of ratings/ignored when Reset pressed; cleared on navigation or edits
                     dcc.Store(id={"type":"reset-snapshot","album":album_id})
                 ], md=9)
             ])
@@ -1043,6 +1055,7 @@ def toggle_ignore(n_clicks_list, ratings_state, ignored_state, widths_state, the
 
 @app.callback(
     Output({"type":"album-ratings","album":MATCH}, "data"),
+    Output({"type":"album-ignored","album":MATCH}, "data", allow_duplicate=True),
     Output({"type":"album-svg","album":MATCH}, "children", allow_duplicate=True),
     Input({"type":"album-events","album":MATCH}, "n_events"),
     State({"type":"album-events","album":MATCH}, "event"),
@@ -1054,26 +1067,33 @@ def toggle_ignore(n_clicks_list, ratings_state, ignored_state, widths_state, the
 )
 def handle_pointer(n_events, evt, ratings, ignored, widths_state, theme_state):
     if not evt:
-        return ratings, no_update
+        return ratings, ignored, no_update
     trig = dash.callback_context.triggered_id
     album_id = trig.get("album") if isinstance(trig, dict) else None
     if album_id is None:
-        return ratings, no_update
+        return ratings, ignored, no_update
     widths_mode = widths_state.get("mode","weighted") if widths_state else "weighted"
     widths = widths_state.get(widths_mode, [1.0]*len(ratings)) if widths_state else [1.0]*len(ratings)
     res = _point_from_offsets(evt.get("offsetX"), evt.get("offsetY"), widths)
     if evt.get("type") == "pointerdown" and res is not None:
-        idx, y_new = res
-        ratings = list(ratings)
-        ratings[idx] = round(y_new,1)
+        idx, val = res
         ensure_rating_struct(album_id)
-        RATINGS[album_id]["ratings"] = ratings
+        ratings = list(ratings)
+        ignored = list(ignored)
+        if val is None:
+            # toggle ignore
+            if 0 <= idx < len(ignored):
+                ignored[idx] = not ignored[idx]
+                RATINGS[album_id]["ignored"] = ignored
+        else:
+            ratings[idx] = round(val,1)
+            RATINGS[album_id]["ratings"] = ratings
         _write_back_album(album_id)
         alb = ALBUMS[album_id]
         theme = theme_state or theme_from_cover(Path(alb["cover_png"]))
         children = _render_svg_children(album_id, ratings, ignored, widths, [t["title"] for t in alb["tracks"]], theme)
-        return ratings, children
-    return ratings, no_update
+        return ratings, ignored, children
+    return ratings, ignored, no_update
 
 @app.callback(
     Output({"type":"album-svg","album":MATCH}, "children", allow_duplicate=True),
