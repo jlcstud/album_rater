@@ -3,11 +3,7 @@ import os, json, math, random, base64, io, re
 from pathlib import Path
 from typing import List, Dict, Tuple
 from datetime import datetime
-
-try:
-    import numpy as np
-except:
-    raise ValueError("If numpy is not found, active 'ar-env' with conda")
+import numpy as np 
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 from sklearn.cluster import KMeans
@@ -16,8 +12,7 @@ from dash import Dash, html, dcc, Input, Output, State, MATCH, ALL, callback_con
 import dash_bootstrap_components as dbc
 from dash_extensions import EventListener
 from dash_svg import Svg, Line, Text, Rect, Polyline, Polygon
-import time
-from bisect import bisect_right
+from bisect import bisect_right as _br
 
 # --------- Config / Paths ----------
 DATA_DIR = Path("output_spotify")         # where albums.json & images/ live
@@ -434,7 +429,7 @@ def album_card_line(result):
 
 UNRATED_ALBUMS = [a for a in ALL_ALBUMS if rated_album_mean(a["album_id"])[2]==0]
 random.shuffle(UNRATED_ALBUMS)
-UNRATED_PICKS = UNRATED_ALBUMS[:3]
+UNRATED_PICKS = UNRATED_ALBUMS[:4]
 
 def home_stats(theme):
     # stats
@@ -458,6 +453,21 @@ def home_stats(theme):
     if means: avg_album_rating = round(float(np.mean(means)), 2)
     avg_album_rating = "" if np.isnan(avg_album_rating) else avg_album_rating
 
+    # Fully rated albums: all tracks either have a rating (not None) or are ignored.
+    fully_rated = 0
+    for a in ALL_ALBUMS:
+        aid = a["album_id"]
+        ensure_rating_struct(aid)
+        rs = RATINGS[aid]["ratings"]
+        igs = RATINGS[aid]["ignored"]
+        all_done = True
+        for r, ig in zip(rs, igs):
+            if (r is None) and (not ig):
+                all_done = False
+                break
+        if all_done:
+            fully_rated += 1
+
     # 3 random unrated covers
     #unrated = [a for a in ALL_ALBUMS if rated_album_mean(a["album_id"])[2]==0]
     #random.shuffle(unrated)
@@ -480,10 +490,20 @@ def home_stats(theme):
         dbc.Col(dbc.Card(dbc.CardBody([html.H5("Mean #tracks/album"), html.H2(avg_tracks)])), md=3),
     ], className="gy-3")
 
+    # Add shuffle button & container for rerolling unrated picks
+    shuffle_btn = dbc.Button("Shuffle", id="shuffle-unrated", size="sm", color="secondary", className="ms-2")
+    unrated_header = html.Div([
+        html.H5("Unrated album picks", className="mb-0"),
+        shuffle_btn
+    ], className="d-flex align-items-center justify-content-between mb-2")
     cards2 = dbc.Row([
-        dbc.Col(dbc.Card(dbc.CardBody([html.H5("Total rated tracks"), html.H2(total_rated)])), md=4),
-        dbc.Col(dbc.Card(dbc.CardBody([html.H5("Mean album rating"), html.H2(avg_album_rating or "—")])), md=4),
-        dbc.Col(dbc.Card(dbc.CardBody([html.H5("Unrated album picks"), html.Div(covers, className="home-covers")])), md=4),
+        dbc.Col(dbc.Card(dbc.CardBody([html.H5("Total rated tracks"), html.H2(total_rated)])), md=3),
+        dbc.Col(dbc.Card(dbc.CardBody([html.H5("Mean album rating"), html.H2(avg_album_rating or "—")])), md=3),
+        dbc.Col(dbc.Card(dbc.CardBody([html.H5("Fully rated albums"), html.H2(fully_rated)])), md=3),
+        dbc.Col(dbc.Card(dbc.CardBody([
+            unrated_header,
+            html.Div(id="unrated-picks", children=covers, className="home-covers")
+        ])), md=3),
     ], className="gy-3")
 
     return html.Div([cards, html.Br(), cards2])
@@ -494,6 +514,37 @@ def layout_home():
         top_nav(),
         dbc.Container(id="home-body", children=[home_stats(theme)], fluid=True)
     ])
+
+# --- Shuffle callback for unrated picks ---
+@app.callback(
+    Output("unrated-picks", "children"),
+    Input("shuffle-unrated", "n_clicks"),
+    prevent_initial_call=True
+)
+def shuffle_unrated(n):
+    # Collect current unrated albums (no rated non-ignored tracks)
+    unrated = []
+    for a in ALL_ALBUMS:
+        aid = a["album_id"]
+        m, wm, c = rated_album_mean(aid)
+        if c == 0:  # no rated tracks
+            unrated.append(a)
+    if not unrated:
+        return html.Div("All albums have at least one rating.", className="muted")
+    random.shuffle(unrated)
+    picks = unrated[:4]
+    covers = []
+    for a in picks:
+        p = get_or_make_thumb(Path(a["cover_png"]), (256,256))
+        covers.append(html.A(
+            html.Img(src=image_to_data_uri(p), className="home-cover"),
+            href=f"/album/{a['album_id']}",
+            className="direct-link",
+            style={"textDecoration":"none"}
+        ))
+    if len(picks) < 4:
+        covers.append(html.Div(f"Only {len(picks)} unrated album(s) remaining.", className="muted mt-2"))
+    return covers
 
 def layout_search(results:List[dict]):
     """Legacy search layout function - modal approach now used instead."""
@@ -546,22 +597,17 @@ MARGIN_L, MARGIN_R, MARGIN_T, MARGIN_B = 60, 24, 70, 52
 PLOT_W = SVG_W - MARGIN_L - MARGIN_R
 PLOT_H = SVG_H - MARGIN_T - MARGIN_B
 Y_MIN, Y_MAX = 0.0, 10.0
-MAX_UPS = 20
-MIN_INTERVAL = 1.0 / MAX_UPS
 
+# We only need pointerdown now (legacy drag interaction removed to avoid needless callbacks).
 LISTEN_EVENTS = [
-    {"event": "pointerdown",  "props": ["type", "offsetX", "offsetY", "buttons"]},
-    {"event": "pointermove",  "props": ["type", "offsetX", "offsetY", "buttons"]},
-    {"event": "pointerup",    "props": ["type", "offsetX", "offsetY", "buttons"]},
-    {"event": "pointerleave", "props": ["type", "offsetX", "offsetY", "buttons"]},
+    {"event": "pointerdown",  "props": ["type", "offsetX", "offsetY", "buttons"]}
 ]
 
 def _build_geometry(widths: list):
-    import numpy as _np
-    w = _np.asarray(widths, float)
+    w = np.asarray(widths, float)
     n = len(w)
-    lefts = _np.empty(n, float)
-    rights = _np.empty(n, float)
+    lefts = np.empty(n, float)
+    rights = np.empty(n, float)
     lefts[0] = -w[0]/2.0
     rights[0] = lefts[0] + w[0]
     for i in range(1,n):
@@ -578,7 +624,6 @@ def _y_to_px(y):
 
 
 def _render_svg_children(album_id:str, ratings:list, ignored:list, widths:list, track_titles:list, theme:Dict):
-    import numpy as _np
     domain_l, domain_r, LEFTS, RIGHTS, CENTERS = _build_geometry(widths)
     elems = []
     # y grid
@@ -669,7 +714,6 @@ def _render_svg_children(album_id:str, ratings:list, ignored:list, widths:list, 
 def _point_from_offsets(offsetX, offsetY, widths):
     if offsetX is None or offsetY is None:
         return None
-    import numpy as _np
     px, py = float(offsetX), float(offsetY)
     # Allow clicks in plot area for rating & below in index band for ignore toggle
     in_plot = (MARGIN_L <= px <= MARGIN_L + PLOT_W and MARGIN_T <= py <= MARGIN_T + PLOT_H)
@@ -677,7 +721,6 @@ def _point_from_offsets(offsetX, offsetY, widths):
     if not (in_plot or in_index):
         return None
     domain_l, domain_r, LEFTS, RIGHTS, CENTERS = _build_geometry(widths)
-    from bisect import bisect_right as _br
     idx = _br(RIGHTS.tolist(), domain_l + (px - MARGIN_L) * (domain_r - domain_l) / PLOT_W)
     idx = min(max(idx,0), len(widths)-1)
     if in_index:
@@ -787,6 +830,15 @@ def layout_album(album_id:str):
     ensure_rating_struct(album_id)
 
     cover_big = image_to_data_uri(Path(alb["cover_png"]))
+    # Compute total album duration in ms
+    total_ms = sum(t.get("duration_ms") or 0 for t in alb["tracks"])
+    secs = total_ms // 1000
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        album_duration_str = f"{h}:{m:02d}:{s:02d}"
+    else:
+        album_duration_str = f"{m}:{s:02d}"
 
     mean, wmean, c = rated_album_mean(album_id)
     rank_box = html.Div(id={"type":"rank-card-container","album":album_id}, children=[render_rank_card(album_id)])
@@ -816,6 +868,7 @@ def layout_album(album_id:str):
                     html.Img(src=cover_big, className="cover-big"),
                     html.H4(alb["album_name"]), html.Div(alb["artists"], className="muted"),
                     html.Div(alb.get("year",""), className="muted"),
+                    html.Div(album_duration_str, className="muted"),
                     accent_color_bar(theme),
                     tracks_table
                 ], md=3),
@@ -1283,21 +1336,7 @@ def guard_label_after_external_change(current_ratings, current_ignored, label):
         return "Reset"
     return dash.no_update
 
-@app.callback(
-    Output({"type":"reset-ratings","album":MATCH}, "children", allow_duplicate=True),
-    Input({"type":"album-events","album":MATCH}, "n_events"),
-    State({"type":"reset-ratings","album":MATCH}, "children"),
-    prevent_initial_call=True
-)
-def invalidate_snapshot_on_pointer(n_events, label):
-    if not n_events or label != "Revert":
-        return dash.no_update
-    trig = dash.callback_context.triggered_id
-    album_id = trig.get("album") if isinstance(trig, dict) else None
-    if album_id in _RESET_SNAPSHOTS:
-        # If a user changes a rating while in Revert mode, they are editing cleared state; keep ability to revert until they change value? Simpler: keep snapshot until revert or toggle ignore
-        pass
-    return dash.no_update
+## Removed invalidate_snapshot_on_pointer: no drag/continuous pointer events remain.
 
 if __name__ == "__main__":
     app.run_server(debug=True)

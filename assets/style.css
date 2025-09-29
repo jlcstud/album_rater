@@ -91,7 +91,7 @@ a, a:link, a:visited { outline: 1px solid rgba(255,0,0,0.5); }
 
 /* Home */
 .home-covers img.home-cover {
-  height: 100px; width: 100px; border-radius: 12px; margin-right: 10px;
+  height: 100px; width: 100px; border-radius: 12px; margin-right: 10px; margin-bottom: 10px;
 }
 
 /* Album */
