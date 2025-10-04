@@ -239,6 +239,46 @@ def save_album_ratings(album_id:str):
         json.dump({"ratings": st["ratings"], "ignored": st["ignored"]}, f, ensure_ascii=False)
     tmp.replace(path)
 
+def delete_album_artifacts(album_id:str):
+    """Remove album from in-memory structures, delete ratings file, remove entry from albums.json, and delete thumbnails & cover image.
+
+    NOTE: This mutates global ALBUMS / ALL_ALBUMS and writes back updated albums.json.
+    """
+    global ALL_ALBUMS, ALBUMS
+    alb = ALBUMS.get(album_id)
+    if not alb:
+        return False
+    # 1. Delete rating file if exists
+    rf = rating_file(album_id)
+    if rf.exists():
+        try: rf.unlink()
+        except Exception: pass
+    # 2. Delete thumbnails referencing this cover
+    cover_path = Path(alb.get("cover_png",""))
+    if cover_path.exists():
+        try: cover_path.unlink()
+        except Exception: pass
+    stem = cover_path.stem
+    # remove generated thumbs (pattern: <stem>_WxH.png)
+    if THUMB_DIR.exists():
+        for p in THUMB_DIR.glob(f"{stem}_*x*.png"):
+            try: p.unlink()
+            except Exception: pass
+    # 3. Remove from albums document and write back
+    albums_list = [a for a in ALL_ALBUMS if a.get("album_id") != album_id]
+    # Persist to JSON_PATH
+    doc = {"albums": albums_list}
+    tmp = JSON_PATH.with_suffix('.tmp')
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(doc, f, indent=2, ensure_ascii=False)
+    tmp.replace(JSON_PATH)
+    # 4. Update in-memory maps
+    ALBUMS = {a["album_id"]: a for a in albums_list}
+    ALL_ALBUMS = list(ALBUMS.values())
+    # 5. Remove RATINGS cache if present
+    RATINGS.pop(album_id, None)
+    return True
+
 def ensure_rating_struct(album_id:str):
     alb = ALBUMS[album_id]
     n = len(alb["tracks"])
@@ -484,7 +524,7 @@ def home_stats(theme):
         )
 
     cards = dbc.Row([
-        dbc.Col(dbc.Card(dbc.CardBody([html.H5("Albums in library"), html.H2(n_albums)])), md=3),
+        dbc.Col(dcc.Link(dbc.Card(dbc.CardBody([html.H5("Albums in library"), html.H2(n_albums)])), href="/albums", className="stat-card-link d-block", style={"textDecoration":"none"}), md=3),
         dbc.Col(dbc.Card(dbc.CardBody([html.H5("Total tracks saved"), html.H2(total_tracks)])), md=3),
         dbc.Col(dbc.Card(dbc.CardBody([html.H5("Mean album length (min)"), html.H2(avg_len_min)])), md=3),
         dbc.Col(dbc.Card(dbc.CardBody([html.H5("Mean #tracks/album"), html.H2(avg_tracks)])), md=3),
@@ -499,7 +539,7 @@ def home_stats(theme):
     cards2 = dbc.Row([
         dbc.Col(dbc.Card(dbc.CardBody([html.H5("Total rated tracks"), html.H2(total_rated)])), md=3),
         dbc.Col(dbc.Card(dbc.CardBody([html.H5("Mean album rating"), html.H2(avg_album_rating or "—")])), md=3),
-        dbc.Col(dbc.Card(dbc.CardBody([html.H5("Fully rated albums"), html.H2(fully_rated)])), md=3),
+        dbc.Col(dcc.Link(dbc.Card(dbc.CardBody([html.H5("Fully rated albums"), html.H2(fully_rated)])), href="/albums", className="stat-card-link d-block", style={"textDecoration":"none"}), md=3),
         dbc.Col(dbc.Card(dbc.CardBody([
             unrated_header,
             html.Div(id="unrated-picks", children=covers, className="home-covers")
@@ -513,6 +553,137 @@ def layout_home():
     return html.Div([
         top_nav(),
         dbc.Container(id="home-body", children=[home_stats(theme)], fluid=True)
+    ])
+
+def _is_fully_rated(aid:str) -> bool:
+    ensure_rating_struct(aid)
+    rs = RATINGS[aid]["ratings"]
+    ig = RATINGS[aid]["ignored"]
+    for r, g in zip(rs, ig):
+        if (r is None) and (not g):
+            return False
+    return True
+
+def _compute_all_album_stats():
+    # rows: (album_id, album_name, artists, mean_u, mean_w, duration_ms, rated_count, fully)
+    rows = []
+    fully_list = []
+    for aid, alb in ALBUMS.items():
+        m_u, m_w, c = rated_album_mean(aid)
+        dur_ms = sum(t.get("duration_ms") or 0 for t in alb["tracks"])
+        fully = _is_fully_rated(aid)
+        rows.append((aid, alb["album_name"], alb["artists"], m_u, m_w, dur_ms, c, fully))
+        if fully:
+            fully_list.append(aid)
+    # Ranks only among fully rated albums with at least one rated non-ignored track and value not None
+    rated_uniform = [(aid, mu) for (aid,_n,_a,mu,_mw,_d,c,fully) in rows if fully and c>0 and mu is not None]
+    rated_duration = [(aid, mw) for (aid,_n,_a,_mu,mw,_d,c,fully) in rows if fully and c>0 and mw is not None]
+    rated_uniform.sort(key=lambda x: x[1], reverse=True)
+    rated_duration.sort(key=lambda x: x[1], reverse=True)
+    uniform_rank = {aid: i+1 for i,(aid,_) in enumerate(rated_uniform)}
+    duration_rank = {aid: i+1 for i,(aid,_) in enumerate(rated_duration)}
+    return rows, uniform_rank, duration_rank
+
+def _format_album_duration(ms:int) -> str:
+    secs = ms//1000
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h>0 else f"{m}:{s:02d}"
+
+# Default sort: Rating (Duration) high -> low.
+# Note: For rating columns (uniform, duration_rating) the code interprets asc=True as reverse sort (high-to-low).
+ALBUM_TABLE_SORT_DEFAULT = {"col":"duration_rating","asc":True}
+
+def render_albums_table(sort_state:dict):
+    sort_col = (sort_state or {}).get("col","album")
+    asc = (sort_state or {}).get("asc", True)
+    rows, u_rank, d_rank = _compute_all_album_stats()
+    # rows: (aid, name, artists, mu, mw, dur_ms, c, fully)
+    # Sorting key mapping (within group)
+    def inner_sort_key(r):
+        aid, name, artists, mu, mw, dur_ms, c, fully = r
+        if sort_col == "album":
+            return name.lower()
+        if sort_col == "artist":
+            return artists.lower()
+        if sort_col == "uniform":
+            return -1e9 if mu is None else mu
+        if sort_col == "duration_rating":
+            return -1e9 if mw is None else mw
+        if sort_col == "dur_total":
+            return dur_ms
+        return name.lower()
+    # For rating columns asc=True => high->low; for others asc=True => low->high
+    if sort_col in ("uniform","duration_rating"):
+        def transform(seq):
+            return sorted(seq, key=inner_sort_key, reverse=True if asc else False)
+    else:
+        def transform(seq):
+            return sorted(seq, key=inner_sort_key, reverse=False if asc else True)
+    # Separate fully vs partial
+    fully_rows = [r for r in rows if r[7]]
+    partial_rows = [r for r in rows if not r[7]]
+    fully_sorted = transform(fully_rows)
+    partial_sorted = transform(partial_rows)
+    rows_sorted = fully_sorted + partial_sorted
+    # Recompute index numbering based on sorted list
+    body_trs = []
+    for idx, (aid, name, artists, mu, mw, dur_ms, c, fully) in enumerate(rows_sorted, start=1):
+        alb = ALBUMS[aid]
+        thumb = get_or_make_thumb(Path(alb["cover_png"]), (64,64))
+        img_uri = image_to_data_uri(thumb)
+        # Uniform rating cell
+        if mu is None:
+            mu_cell = "—"
+        else:
+            rk = u_rank.get(aid) if fully else None
+            pill = html.Span(str(rk), className="rank-pill") if rk else ""
+            mu_cell = html.Span([f"{mu:.2f}", pill])
+        if mw is None:
+            mw_cell = "—"
+        else:
+            rk2 = d_rank.get(aid) if fully else None
+            pill2 = html.Span(str(rk2), className="rank-pill") if rk2 else ""
+            mw_cell = html.Span([f"{mw:.2f}", pill2])
+        body_trs.append(html.Tr([
+            html.Td(idx),
+            html.Td(html.Div([
+                html.Img(src=img_uri, style={"width":"42px","height":"42px","borderRadius":"6px","objectFit":"cover"}),
+                html.A(name, href=f"/album/{aid}", className="album-link")
+            ], className="album-cell")),
+            html.Td(artists),
+            html.Td(mu_cell),
+            html.Td(mw_cell),
+            html.Td(_format_album_duration(dur_ms))
+        ]))
+    # Header arrows
+    def hdr(label, col_key):
+        arrow = ""
+        if sort_col == col_key:
+            arrow = " ▲" if asc else " ▼"
+        return html.Th(label + arrow, id={"type":"albums-header","col":col_key})
+    thead = html.Thead(html.Tr([
+        hdr("#","index"),
+        hdr("Album","album"),
+        hdr("Artist","artist"),
+        hdr("Rating (Uniform)","uniform"),
+        hdr("Rating (Duration)","duration_rating"),
+        hdr("Duration","dur_total")
+    ]))
+    table = html.Table([
+        thead,
+        html.Tbody(body_trs)
+    ], className="album-table")
+    return table
+
+def layout_albums():
+    return html.Div([
+        top_nav(),
+        dbc.Container([
+            html.H3("Albums"),
+            dcc.Store(id="albums-sort", data=ALBUM_TABLE_SORT_DEFAULT),
+            html.Div(id="albums-table-container", children=[render_albums_table(ALBUM_TABLE_SORT_DEFAULT)])
+        ], fluid=True)
     ])
 
 # --- Shuffle callback for unrated picks ---
@@ -789,7 +960,8 @@ def album_ignore_strip(album_id:str, theme:Dict):
 
 def render_rank_card(album_id:str):
     """Return a rank card component for the given album id (no callbacks)."""
-    rank_table = compute_album_rank_table(album_id)
+    fully = _is_fully_rated(album_id)
+    rank_table = compute_album_rank_table(album_id) if fully else {"uniform":(None,None),"duration":(None,None)}
     def fmt(pair:Tuple[int,int]):
         r, total = pair
         return f"{r}/{total}" if r is not None and total else "—"
@@ -801,7 +973,7 @@ def render_rank_card(album_id:str):
                     html.Tr([html.Td("Uniform"), html.Td(fmt(rank_table["uniform"]), style={"textAlign":"right"})]),
                     html.Tr([html.Td("Duration"), html.Td(fmt(rank_table["duration"]), style={"textAlign":"right"})])
                 ])
-            ], className="rank-table")
+            ], className="rank-table"),
         ]), className="rank-card", id={"type":"rank-card","album":album_id})
 
 def accent_color_bar(theme:Dict):
@@ -870,7 +1042,31 @@ def layout_album(album_id:str):
                     html.Div(alb.get("year",""), className="muted"),
                     html.Div(album_duration_str, className="muted"),
                     accent_color_bar(theme),
-                    tracks_table
+                    tracks_table,
+                    # Delete album button relocated here to be less visually intrusive
+                    html.Div([
+                        dbc.Button(
+                            "Delete Album",
+                            id="delete-album-btn",
+                            color="danger",
+                            outline=True,
+                            size="sm",
+                            className="mt-2"
+                        ),
+                        dbc.Modal([
+                            dbc.ModalHeader(dbc.ModalTitle("Confirm Deletion")),
+                            dbc.ModalBody([
+                                html.P("This will permanently remove this album, its ratings file, and cached images from the library. This action cannot be undone."),
+                                html.P("Are you sure you want to continue?", className="fw-bold")
+                            ]),
+                            dbc.ModalFooter([
+                                dbc.Button("Cancel", id="delete-cancel-btn", className="me-2"),
+                                dbc.Button("Delete Album", id="delete-confirm-btn", color="danger")
+                            ])
+                        ], id="delete-modal", is_open=False, centered=True, backdrop="static"),
+                    ]),
+                    # Store current album id for deletion callbacks
+                    dcc.Store(id="current-album-id", data=album_id)
                 ], md=3),
                 dbc.Col([
                     stat_cards, html.Br(),
@@ -878,7 +1074,7 @@ def layout_album(album_id:str):
                     html.Div([
                         dbc.Button("Toggle Bar Widths", id={"type":"width-toggle","album":album_id}, color="secondary", size="sm", className="me-2"),
                         dbc.Button("Update Ranks", id={"type":"update-ranks","album":album_id}, color="secondary", size="sm", className="me-2"),
-                        dbc.Button("Reset", id={"type":"reset-ratings","album":album_id}, color="danger", outline=True, size="sm"),
+                        dbc.Button("Reset", id={"type":"reset-ratings","album":album_id}, color="warning", outline=True, size="sm", className="me-2"),
                     ], className="d-flex align-items-center flex-wrap gap-2 mb-2"),
                     svg_rating_component(album_id, theme),
                     dcc.Store(id={"type":"album-state","album":album_id}, data=RATINGS.get(album_id)),
@@ -916,6 +1112,8 @@ app.layout = html.Div([
 def router(pathname:str):
     if not pathname or pathname == "/":
         return [layout_home()]
+    if pathname == "/albums":
+        return [layout_albums()]
     if pathname.startswith("/album/"):
         aid = pathname.split("/album/")[1]
         if aid in ALBUMS: return [layout_album(aid)]
@@ -932,6 +1130,43 @@ def clear_search_on_album(pathname):
     if pathname and pathname.startswith("/album/"):
         return ""
     return dash.no_update
+
+
+@app.callback(
+    Output("albums-sort","data"),
+    Output("albums-table-container","children"),
+    Input({"type":"albums-header","col":ALL}, "n_clicks"),
+    State("albums-sort","data"),
+    prevent_initial_call=True
+)
+def sort_albums(header_clicks, sort_state):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return dash.no_update, dash.no_update
+    trig = ctx.triggered[0]["prop_id"].split(".")[0]
+    try:
+        obj = json.loads(trig)
+    except Exception:
+        return dash.no_update, dash.no_update
+    col = obj.get("col")
+    if col is None:
+        return dash.no_update, dash.no_update
+    # index column is not sortable (rely on natural order) -> map to album for stability
+    if col == "index":
+        col = "album"
+    prev_col = (sort_state or {}).get("col","album")
+    prev_asc = (sort_state or {}).get("asc", True)
+    if col == prev_col:
+        # toggle
+        new_state = {"col": col, "asc": not prev_asc}
+    else:
+        # First click on a new column: set asc flag so that ratings show high->low, others low->high.
+        if col in ("uniform","duration_rating"):
+            new_state = {"col": col, "asc": True}  # asc=True triggers reverse for ratings (high-first)
+        else:
+            new_state = {"col": col, "asc": True}  # standard ascending for text/duration
+    table = render_albums_table(new_state)
+    return new_state, [table]
 
 # search as-you-type
 @app.callback(
@@ -1185,6 +1420,39 @@ def update_ranks(n_clicks):
     mean_disp = mean if mean is not None else "—"
     wmean_disp = wmean if wmean is not None else "—"
     return [render_rank_card(album_id)], mean_disp, wmean_disp
+
+@app.callback(
+    Output("delete-modal", "is_open"),
+    Input("delete-album-btn", "n_clicks"),
+    Input("delete-cancel-btn", "n_clicks"),
+    State("delete-modal", "is_open"),
+    prevent_initial_call=True
+)
+def toggle_delete_modal_static(open_click, cancel_click, is_open):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return dash.no_update
+    trig = ctx.triggered_id
+    if trig == "delete-album-btn":
+        return True
+    if trig == "delete-cancel-btn":
+        return False
+    return dash.no_update
+
+@app.callback(
+    Output("url","pathname", allow_duplicate=True),
+    Output("delete-modal", "is_open", allow_duplicate=True),
+    Input("delete-confirm-btn", "n_clicks"),
+    State("current-album-id", "data"),
+    prevent_initial_call=True
+)
+def confirm_delete_static(n, album_id):
+    if not n or not album_id:
+        return dash.no_update, dash.no_update
+    ok = delete_album_artifacts(album_id)
+    if ok:
+        return "/", False
+    return dash.no_update, False
 
 
 @app.callback(

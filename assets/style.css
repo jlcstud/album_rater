@@ -113,3 +113,15 @@ a, a:link, a:visited { outline: 1px solid rgba(255,0,0,0.5); }
 
 /* Accent color bar under album metadata */
 .accent-bar { box-shadow: 0 0 0 1px #0e0f12 inset; }
+
+/* Albums table */
+.album-table { width:100%; font-size:0.9rem; border-collapse:collapse; }
+.album-table th { cursor:pointer; user-select:none; padding:6px 8px; border-bottom:1px solid #2a2d33; color:#dfe2e7; font-weight:600; background:#171a20; }
+.album-table td { padding:6px 8px; border-bottom:1px solid #22252b; vertical-align:middle; }
+.album-table tr:hover { background:#1f2329; }
+.album-cell { display:flex; align-items:center; gap:10px; }
+.album-link { color:#dfe2e7; text-decoration:none; font-weight:600; }
+.album-link:hover { text-decoration:underline; }
+.rank-pill { display:inline-block; margin-left:6px; padding:1px 6px 0 6px; font-size:0.7rem; line-height:1.1rem; border:1px solid #3a4651; border-radius:6px; background:#222a31; color:#cbd6dd; }
+.stat-card-link { cursor:pointer; }
+.stat-card-link:hover { box-shadow:0 0 0 2px #2aa9ff inset; }
