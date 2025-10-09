@@ -23,6 +23,12 @@ RATINGS_DIR.mkdir(parents=True, exist_ok=True)
 THUMB_DIR = DATA_DIR / "thumbs"
 THUMB_DIR.mkdir(parents=True, exist_ok=True)
 
+# --- Global Rating Mean Mode ---
+# If True, all album mean ratings and ranks use duration-weighted means.
+# If False, they use uniform (unweighted) means.
+# Toggle this boolean to switch globally.
+MEAN_WEIGHTED = True
+
 # --------- Utilities ----------
 def load_json(path: Path) -> dict:
     if path.exists():
@@ -292,7 +298,11 @@ def _write_back_album(album_id:str):
     save_album_ratings(album_id)
 
 def rated_album_mean(album_id:str) -> Tuple[float,float,int]:
-    """Return (mean, duration-weighted mean, count_used) excluding ignored and None."""
+    """Return (mean, duration-weighted mean, count_used) excluding ignored and None.
+
+    Note: This function returns both variants for completeness, but the rest of the app
+    should rely on selected_album_mean() for the single, globally-chosen metric.
+    """
     alb = ALBUMS[album_id]
     ensure_rating_struct(album_id)
     r = RATINGS[album_id]["ratings"]
@@ -308,43 +318,49 @@ def rated_album_mean(album_id:str) -> Tuple[float,float,int]:
     wmean = sum(v*w for v,w in zip(vals,weights))/wsum
     return (round(mean,2), round(wmean,2), len(vals))
 
-def overall_rank(album_id:str, key="mean") -> Tuple[int,int]:
-    """Rank among albums with at least one rated track."""
+def selected_album_mean(album_id:str) -> Tuple[float,int]:
+    """Return (mean_for_current_mode, count_used) based on MEAN_WEIGHTED toggle."""
+    mu, mw, c = rated_album_mean(album_id)
+    if c == 0:
+        return (None, 0)
+    return ((mw if MEAN_WEIGHTED else mu), c)
+
+def overall_rank(album_id:str, key: str = "mean") -> Tuple[int,int]:
+    """Rank among albums with at least one rated track using selected mean.
+
+    Note: 'key' is ignored; retained for backward compatibility."""
     scores = []
     for aid in ALBUMS.keys():
-        m, wm, c = rated_album_mean(aid)
-        if c>0:
-            scores.append((aid, wm if key=="wmean" else m))
-    scores = [(aid, s) for (aid,s) in scores if s is not None]
+        mv, c = selected_album_mean(aid)
+        if c>0 and mv is not None:
+            scores.append((aid, mv))
     scores.sort(key=lambda x: x[1], reverse=True)
     idx = next((i for i,(aid,_) in enumerate(scores) if aid==album_id), None)
-    if idx is None: return (None, len(scores))
+    if idx is None:
+        return (None, len(scores))
     return (idx+1, len(scores))
 
-def compute_album_rank_table(target_album_id:str) -> Dict[str,Tuple[int,int]]:
-    """Compute rank positions (uniform & duration means only) for an album.
+def compute_album_rank_single(target_album_id:str) -> Tuple[int,int]:
+    """Compute overall rank for the target album using the globally selected mean.
 
-    Returns dict mapping metric -> (rank, total_albums_with_ratings)
-    Only albums with at least one rated (non-ignored) track are considered.
-    """
-    rows = []  # (album_id, uniform_mean, duration_mean)
-    for aid in ALBUMS.keys():
-        mean_u, mean_dur, cnt = rated_album_mean(aid)
-        if cnt > 0 and mean_u is not None and mean_dur is not None:
-            rows.append((aid, mean_u, mean_dur))
-    def build_rank_map(idx:int):
-        ordered = sorted(((aid, r[idx+1]) for aid,*r in [(a,u,d) for (a,u,d) in rows]), key=lambda x: x[1], reverse=True)
-        total = len(ordered)
-        return {aid:(i+1,total) for i,(aid,_) in enumerate(ordered)}
-    # simpler direct maps
-    uniform_ranks = sorted(((aid,u) for (aid,u,_) in rows), key=lambda x:x[1], reverse=True)
-    duration_ranks = sorted(((aid,d) for (aid,_,d) in rows), key=lambda x:x[1], reverse=True)
-    uniform_map = {aid:(i+1,len(uniform_ranks)) for i,(aid,_) in enumerate(uniform_ranks)}
-    duration_map = {aid:(i+1,len(duration_ranks)) for i,(aid,_) in enumerate(duration_ranks)}
-    return {
-        "uniform": uniform_map.get(target_album_id, (None, len(uniform_ranks))),
-        "duration": duration_map.get(target_album_id, (None, len(duration_ranks)))
-    }
+    Only considers albums with at least one rated (non-ignored) track and with a non-None mean.
+    Ranks are among fully rated albums for stability, matching prior behavior.
+    Returns (rank_position, total_albums_considered)."""
+    rows = []  # (album_id, selected_mean, fully)
+    for aid, alb in ALBUMS.items():
+        mean_val, cnt = selected_album_mean(aid)
+        if cnt > 0 and mean_val is not None:
+            rows.append((aid, mean_val, _is_fully_rated(aid)))
+    # filter to fully rated
+    rows = [r for r in rows if r[2]]
+    if not rows:
+        return (None, 0)
+    rows.sort(key=lambda x: x[1], reverse=True)
+    total = len(rows)
+    pos = next((i for i,(aid,_,__) in enumerate(rows) if aid==target_album_id), None)
+    if pos is None:
+        return (None, total)
+    return (pos+1, total)
 
 # Search index
 def build_search_index():
@@ -433,6 +449,20 @@ def top_nav():
                 className="nav-home-link direct-link",
                 style={"textDecoration":"none", "display":"inline-block", "padding":"0", "margin":"0"}
             ),
+            # Albums button - navigate to albums table
+            html.A(
+                dbc.Button("Albums", color="secondary", className="me-2", id="albums-btn"),
+                href="/albums",
+                className="nav-albums-link direct-link",
+                style={"textDecoration":"none", "display":"inline-block", "padding":"0", "margin":"0"}
+            ),
+            # Settings button (gear icon) - appears next to Home
+            html.A(
+                dbc.Button("⚙", color="secondary", className="me-2", id="settings-btn", title="Settings"),
+                href="/settings",
+                className="nav-settings-link direct-link",
+                style={"textDecoration":"none", "display":"inline-block", "padding":"0", "margin":"0"}
+            ),
 
             # centered search bar
             dbc.Input(id="search-input", type="text", placeholder="Search albums & artists…",
@@ -467,7 +497,7 @@ def album_card_line(result):
         style={"textDecoration":"none"}
     )
 
-UNRATED_ALBUMS = [a for a in ALL_ALBUMS if rated_album_mean(a["album_id"])[2]==0]
+UNRATED_ALBUMS = [a for a in ALL_ALBUMS if selected_album_mean(a["album_id"])[1]==0]
 random.shuffle(UNRATED_ALBUMS)
 UNRATED_PICKS = UNRATED_ALBUMS[:4]
 
@@ -488,9 +518,11 @@ def home_stats(theme):
     avg_album_rating = np.nan
     means = []
     for aid in ALBUMS.keys():
-        m, wm, c = rated_album_mean(aid)
-        if c>0 and m is not None: means.append(m)
-    if means: avg_album_rating = round(float(np.mean(means)), 2)
+        mv, c = selected_album_mean(aid)
+        if c>0 and mv is not None:
+            means.append(mv)
+    if means:
+        avg_album_rating = round(float(np.mean(means)), 2)
     avg_album_rating = "" if np.isnan(avg_album_rating) else avg_album_rating
 
     # Fully rated albums: all tracks either have a rating (not None) or are ignored.
@@ -509,7 +541,7 @@ def home_stats(theme):
             fully_rated += 1
 
     # 3 random unrated covers
-    #unrated = [a for a in ALL_ALBUMS if rated_album_mean(a["album_id"])[2]==0]
+    #unrated = [a for a in ALL_ALBUMS if selected_album_mean(a["album_id"])[1]==0]
     #random.shuffle(unrated)
     covers = []
     for a in UNRATED_PICKS:
@@ -524,7 +556,7 @@ def home_stats(theme):
         )
 
     cards = dbc.Row([
-        dbc.Col(dcc.Link(dbc.Card(dbc.CardBody([html.H5("Albums in library"), html.H2(n_albums)])), href="/albums", className="stat-card-link d-block", style={"textDecoration":"none"}), md=3),
+        dbc.Col(dbc.Card(dbc.CardBody([html.H5("Albums in library"), html.H2(n_albums)])), md=3),
         dbc.Col(dbc.Card(dbc.CardBody([html.H5("Total tracks saved"), html.H2(total_tracks)])), md=3),
         dbc.Col(dbc.Card(dbc.CardBody([html.H5("Mean album length (min)"), html.H2(avg_len_min)])), md=3),
         dbc.Col(dbc.Card(dbc.CardBody([html.H5("Mean #tracks/album"), html.H2(avg_tracks)])), md=3),
@@ -539,7 +571,7 @@ def home_stats(theme):
     cards2 = dbc.Row([
         dbc.Col(dbc.Card(dbc.CardBody([html.H5("Total rated tracks"), html.H2(total_rated)])), md=3),
         dbc.Col(dbc.Card(dbc.CardBody([html.H5("Mean album rating"), html.H2(avg_album_rating or "—")])), md=3),
-        dbc.Col(dcc.Link(dbc.Card(dbc.CardBody([html.H5("Fully rated albums"), html.H2(fully_rated)])), href="/albums", className="stat-card-link d-block", style={"textDecoration":"none"}), md=3),
+        dbc.Col(dbc.Card(dbc.CardBody([html.H5("Fully rated albums"), html.H2(fully_rated)])), md=3),
         dbc.Col(dbc.Card(dbc.CardBody([
             unrated_header,
             html.Div(id="unrated-picks", children=covers, className="home-covers")
@@ -565,24 +597,18 @@ def _is_fully_rated(aid:str) -> bool:
     return True
 
 def _compute_all_album_stats():
-    # rows: (album_id, album_name, artists, mean_u, mean_w, duration_ms, rated_count, fully)
+    # rows: (album_id, album_name, artists, sel_mean, duration_ms, rated_count, fully)
     rows = []
-    fully_list = []
     for aid, alb in ALBUMS.items():
-        m_u, m_w, c = rated_album_mean(aid)
+        mv, c = selected_album_mean(aid)
         dur_ms = sum(t.get("duration_ms") or 0 for t in alb["tracks"])
         fully = _is_fully_rated(aid)
-        rows.append((aid, alb["album_name"], alb["artists"], m_u, m_w, dur_ms, c, fully))
-        if fully:
-            fully_list.append(aid)
+        rows.append((aid, alb["album_name"], alb["artists"], mv, dur_ms, c, fully))
     # Ranks only among fully rated albums with at least one rated non-ignored track and value not None
-    rated_uniform = [(aid, mu) for (aid,_n,_a,mu,_mw,_d,c,fully) in rows if fully and c>0 and mu is not None]
-    rated_duration = [(aid, mw) for (aid,_n,_a,_mu,mw,_d,c,fully) in rows if fully and c>0 and mw is not None]
-    rated_uniform.sort(key=lambda x: x[1], reverse=True)
-    rated_duration.sort(key=lambda x: x[1], reverse=True)
-    uniform_rank = {aid: i+1 for i,(aid,_) in enumerate(rated_uniform)}
-    duration_rank = {aid: i+1 for i,(aid,_) in enumerate(rated_duration)}
-    return rows, uniform_rank, duration_rank
+    rated = [(aid, mv) for (aid,_n,_a,mv,_d,c,fully) in rows if fully and c>0 and mv is not None]
+    rated.sort(key=lambda x: x[1], reverse=True)
+    rank_map = {aid: i+1 for i,(aid,_) in enumerate(rated)}
+    return rows, rank_map
 
 def _format_album_duration(ms:int) -> str:
     secs = ms//1000
@@ -590,61 +616,53 @@ def _format_album_duration(ms:int) -> str:
     m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h>0 else f"{m}:{s:02d}"
 
-# Default sort: Rating (Duration) high -> low.
-# Note: For rating columns (uniform, duration_rating) the code interprets asc=True as reverse sort (high-to-low).
-ALBUM_TABLE_SORT_DEFAULT = {"col":"duration_rating","asc":True}
+# Default sort: Rating high -> low.
+# Note: For rating column the code interprets asc=True as reverse sort (high-to-low).
+ALBUM_TABLE_SORT_DEFAULT = {"col":"rating","asc":True}
 
 def render_albums_table(sort_state:dict):
     sort_col = (sort_state or {}).get("col","album")
     asc = (sort_state or {}).get("asc", True)
-    rows, u_rank, d_rank = _compute_all_album_stats()
-    # rows: (aid, name, artists, mu, mw, dur_ms, c, fully)
+    rows, rank_map = _compute_all_album_stats()
+    # rows: (aid, name, artists, mv, dur_ms, c, fully)
     # Sorting key mapping (within group)
     def inner_sort_key(r):
-        aid, name, artists, mu, mw, dur_ms, c, fully = r
+        aid, name, artists, mv, dur_ms, c, fully = r
         if sort_col == "album":
             return name.lower()
         if sort_col == "artist":
             return artists.lower()
-        if sort_col == "uniform":
-            return -1e9 if mu is None else mu
-        if sort_col == "duration_rating":
-            return -1e9 if mw is None else mw
+        if sort_col == "rating":
+            return -1e9 if mv is None else mv
         if sort_col == "dur_total":
             return dur_ms
         return name.lower()
     # For rating columns asc=True => high->low; for others asc=True => low->high
-    if sort_col in ("uniform","duration_rating"):
+    if sort_col in ("rating",):
         def transform(seq):
             return sorted(seq, key=inner_sort_key, reverse=True if asc else False)
     else:
         def transform(seq):
             return sorted(seq, key=inner_sort_key, reverse=False if asc else True)
     # Separate fully vs partial
-    fully_rows = [r for r in rows if r[7]]
-    partial_rows = [r for r in rows if not r[7]]
+    fully_rows = [r for r in rows if r[6]]
+    partial_rows = [r for r in rows if not r[6]]
     fully_sorted = transform(fully_rows)
     partial_sorted = transform(partial_rows)
     rows_sorted = fully_sorted + partial_sorted
     # Recompute index numbering based on sorted list
     body_trs = []
-    for idx, (aid, name, artists, mu, mw, dur_ms, c, fully) in enumerate(rows_sorted, start=1):
+    for idx, (aid, name, artists, mv, dur_ms, c, fully) in enumerate(rows_sorted, start=1):
         alb = ALBUMS[aid]
         thumb = get_or_make_thumb(Path(alb["cover_png"]), (64,64))
         img_uri = image_to_data_uri(thumb)
-        # Uniform rating cell
-        if mu is None:
-            mu_cell = "—"
+        # Selected rating cell
+        if mv is None:
+            rating_cell = "—"
         else:
-            rk = u_rank.get(aid) if fully else None
+            rk = rank_map.get(aid) if fully else None
             pill = html.Span(str(rk), className="rank-pill") if rk else ""
-            mu_cell = html.Span([f"{mu:.2f}", pill])
-        if mw is None:
-            mw_cell = "—"
-        else:
-            rk2 = d_rank.get(aid) if fully else None
-            pill2 = html.Span(str(rk2), className="rank-pill") if rk2 else ""
-            mw_cell = html.Span([f"{mw:.2f}", pill2])
+            rating_cell = html.Span([f"{mv:.2f}", pill])
         body_trs.append(html.Tr([
             html.Td(idx),
             html.Td(html.Div([
@@ -652,8 +670,7 @@ def render_albums_table(sort_state:dict):
                 html.A(name, href=f"/album/{aid}", className="album-link")
             ], className="album-cell")),
             html.Td(artists),
-            html.Td(mu_cell),
-            html.Td(mw_cell),
+            html.Td(rating_cell),
             html.Td(_format_album_duration(dur_ms))
         ]))
     # Header arrows
@@ -666,8 +683,7 @@ def render_albums_table(sort_state:dict):
         hdr("#","index"),
         hdr("Album","album"),
         hdr("Artist","artist"),
-        hdr("Rating (Uniform)","uniform"),
-        hdr("Rating (Duration)","duration_rating"),
+        hdr("Rating","rating"),
         hdr("Duration","dur_total")
     ]))
     table = html.Table([
@@ -686,6 +702,26 @@ def layout_albums():
         ], fluid=True)
     ])
 
+def layout_settings():
+    # Single switch: Use uniform mean instead of duration-weighted
+    use_uniform_default = [] if MEAN_WEIGHTED else ["uniform"]
+    switch = dbc.Checklist(
+        options=[{"label": "Use uniform mean (instead of duration-weighted)", "value": "uniform"}],
+        value=use_uniform_default,
+        id="mean-mode-switch",
+        switch=True,
+    )
+    return html.Div([
+        top_nav(),
+        dbc.Container([
+            html.H3("Settings"),
+            html.Div(switch, className="mb-2"),
+            html.Div("Toggle to switch the album rating mean calculation.", className="muted"),
+            # hidden sink for side-effect callback
+            html.Div(id="settings-status", style={"display":"none"})
+        ], fluid=True)
+    ])
+
 # --- Shuffle callback for unrated picks ---
 @app.callback(
     Output("unrated-picks", "children"),
@@ -697,7 +733,7 @@ def shuffle_unrated(n):
     unrated = []
     for a in ALL_ALBUMS:
         aid = a["album_id"]
-        m, wm, c = rated_album_mean(aid)
+        _m, c = selected_album_mean(aid)
         if c == 0:  # no rated tracks
             unrated.append(a)
     if not unrated:
@@ -961,17 +997,15 @@ def album_ignore_strip(album_id:str, theme:Dict):
 def render_rank_card(album_id:str):
     """Return a rank card component for the given album id (no callbacks)."""
     fully = _is_fully_rated(album_id)
-    rank_table = compute_album_rank_table(album_id) if fully else {"uniform":(None,None),"duration":(None,None)}
-    def fmt(pair:Tuple[int,int]):
-        r, total = pair
-        return f"{r}/{total}" if r is not None and total else "—"
+    r, total = compute_album_rank_single(album_id) if fully else (None, 0)
+    mode_label = "Duration-weighted" if MEAN_WEIGHTED else "Uniform"
+    value = f"{r}/{total}" if r is not None and total else "—"
     return dbc.Card(
         dbc.CardBody([
             html.Table([
-                html.Thead(html.Tr([html.Th("Type"), html.Th("Rank", style={"textAlign":"right"})])),
+                html.Thead(html.Tr([html.Th("Metric"), html.Th("Rank", style={"textAlign":"right"})])),
                 html.Tbody([
-                    html.Tr([html.Td("Uniform"), html.Td(fmt(rank_table["uniform"]), style={"textAlign":"right"})]),
-                    html.Tr([html.Td("Duration"), html.Td(fmt(rank_table["duration"]), style={"textAlign":"right"})])
+                    html.Tr([html.Td(mode_label), html.Td(value, style={"textAlign":"right"})]),
                 ])
             ], className="rank-table"),
         ]), className="rank-card", id={"type":"rank-card","album":album_id})
@@ -1012,13 +1046,12 @@ def layout_album(album_id:str):
     else:
         album_duration_str = f"{m}:{s:02d}"
 
-    mean, wmean, c = rated_album_mean(album_id)
+    sel_mean, c = selected_album_mean(album_id)
     rank_box = html.Div(id={"type":"rank-card-container","album":album_id}, children=[render_rank_card(album_id)])
-
+    mode_label = "Mean (Duration)" if MEAN_WEIGHTED else "Mean (Uniform)"
     stat_cards = dbc.Row([
-        dbc.Col(dbc.Card(dbc.CardBody([html.H6("Mean (Uniform)"), html.H3(mean if mean is not None else "—", id={"type":"mean-uniform","album":album_id})])), md=4),
-        dbc.Col(dbc.Card(dbc.CardBody([html.H6("Mean (Duration)"), html.H3(wmean if wmean is not None else "—", id={"type":"mean-duration","album":album_id})])), md=4),
-        dbc.Col(rank_box, md=4),
+        dbc.Col(dbc.Card(dbc.CardBody([html.H6(mode_label), html.H3(sel_mean if sel_mean is not None else "—", id={"type":"mean-selected","album":album_id})])), md=6),
+        dbc.Col(rank_box, md=6),
     ], className="gy-2")
 
     tracks_table = dbc.Table(
@@ -1114,6 +1147,8 @@ def router(pathname:str):
         return [layout_home()]
     if pathname == "/albums":
         return [layout_albums()]
+    if pathname == "/settings":
+        return [layout_settings()]
     if pathname.startswith("/album/"):
         aid = pathname.split("/album/")[1]
         if aid in ALBUMS: return [layout_album(aid)]
@@ -1161,7 +1196,7 @@ def sort_albums(header_clicks, sort_state):
         new_state = {"col": col, "asc": not prev_asc}
     else:
         # First click on a new column: set asc flag so that ratings show high->low, others low->high.
-        if col in ("uniform","duration_rating"):
+        if col in ("rating",):
             new_state = {"col": col, "asc": True}  # asc=True triggers reverse for ratings (high-first)
         else:
             new_state = {"col": col, "asc": True}  # standard ascending for text/duration
@@ -1288,6 +1323,20 @@ def manage_search_modal(is_open, pathname):
 # New Callbacks for SVG rating
 ###############################
 
+# Settings callback: update global mean mode from switch
+@app.callback(
+    Output("settings-status", "children"),
+    Input("mean-mode-switch", "value"),
+    prevent_initial_call=False
+)
+def apply_mean_mode_switch(values):
+    # values is a list containing 'uniform' when switch is on
+    global MEAN_WEIGHTED
+    want_uniform = isinstance(values, list) and ("uniform" in values)
+    MEAN_WEIGHTED = not want_uniform
+    # return a small status string for visibility in dev tools if needed
+    return "uniform" if want_uniform else "weighted"
+
 @app.callback(
     Output({"type":"album-widths","album":MATCH}, "data"),
     Input({"type":"width-toggle","album":MATCH}, "n_clicks"),
@@ -1405,8 +1454,7 @@ def update_widths(width_state, ratings, ignored, theme_state):
 
 @app.callback(
     Output({"type":"rank-card-container","album":MATCH}, "children"),
-    Output({"type":"mean-uniform","album":MATCH}, "children"),
-    Output({"type":"mean-duration","album":MATCH}, "children"),
+    Output({"type":"mean-selected","album":MATCH}, "children"),
     Input({"type":"update-ranks","album":MATCH}, "n_clicks"),
     prevent_initial_call=True
 )
@@ -1414,12 +1462,11 @@ def update_ranks(n_clicks):
     trig = dash.callback_context.triggered_id
     album_id = trig.get("album") if isinstance(trig, dict) else None
     if album_id is None:
-        return dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update
     # Recompute stats
-    mean, wmean, c = rated_album_mean(album_id)
-    mean_disp = mean if mean is not None else "—"
-    wmean_disp = wmean if wmean is not None else "—"
-    return [render_rank_card(album_id)], mean_disp, wmean_disp
+    sel_mean, c = selected_album_mean(album_id)
+    sel_disp = sel_mean if sel_mean is not None else "—"
+    return [render_rank_card(album_id)], sel_disp
 
 @app.callback(
     Output("delete-modal", "is_open"),
