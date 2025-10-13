@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import os, json, math, random, base64, io, re
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 import numpy as np 
 from PIL import Image
@@ -28,6 +28,21 @@ THUMB_DIR.mkdir(parents=True, exist_ok=True)
 # If False, they use uniform (unweighted) means.
 # Toggle this boolean to switch globally.
 MEAN_WEIGHTED = True
+
+TIER_SPECS = [
+    ("S", "#ff7f7e", 2),  # top ~2 of 40
+    ("A", "#ffbf7f", 4),  # next ~4 of 40
+    ("B", "#feff7f", 8),  # next ~8 of 40
+    ("C", "#beff7f", 12), # mid ~12 of 40
+    ("D", "#7fbfff", 8),  # next ~8 of 40
+    ("E", "#807fff", 4),  # next ~4 of 40
+    ("F", "#ff7ffe", 2),  # bottom ~2 of 40
+]
+TIER_TOTAL_WEIGHT = sum(weight for _tier, _color, weight in TIER_SPECS)
+
+TIERLIST_ROW_OPTIONS = list(range(1, 21)) + [25, 30, 35, 40, 45, 50]
+TIERLIST_ALBUMS_PER_ROW = 16
+TIERLIST_USE_LARGE_THUMBS = True
 
 # --------- Utilities ----------
 def load_json(path: Path) -> dict:
@@ -346,21 +361,103 @@ def compute_album_rank_single(target_album_id:str) -> Tuple[int,int]:
     Only considers albums with at least one rated (non-ignored) track and with a non-None mean.
     Ranks are among fully rated albums for stability, matching prior behavior.
     Returns (rank_position, total_albums_considered)."""
-    rows = []  # (album_id, selected_mean, fully)
-    for aid, alb in ALBUMS.items():
-        mean_val, cnt = selected_album_mean(aid)
-        if cnt > 0 and mean_val is not None:
-            rows.append((aid, mean_val, _is_fully_rated(aid)))
-    # filter to fully rated
-    rows = [r for r in rows if r[2]]
+    rows = _rank_rows()
+    total = len(rows)
     if not rows:
         return (None, 0)
-    rows.sort(key=lambda x: x[1], reverse=True)
-    total = len(rows)
-    pos = next((i for i,(aid,_,__) in enumerate(rows) if aid==target_album_id), None)
+    pos = next((i for i,(aid, _) in enumerate(rows) if aid == target_album_id), None)
     if pos is None:
         return (None, total)
-    return (pos+1, total)
+    return (pos + 1, total)
+
+
+def _rank_rows() -> List[Tuple[str, float]]:
+    """Return fully rated albums with their selected means sorted descending."""
+    rows: List[Tuple[str, float]] = []
+    for aid, _alb in ALBUMS.items():
+        mean_val, cnt = selected_album_mean(aid)
+        if cnt > 0 and mean_val is not None and _is_fully_rated(aid):
+            rows.append((aid, mean_val))
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return rows
+
+
+def tier_for_rank(rank_index:int, total:int) -> Tuple[Optional[str], Optional[str]]:
+    """Return (tier_label, color) for the given zero-based rank index."""
+    if total <= 0 or rank_index is None:
+        return (None, None)
+    # Ensure index stays within bounds
+    rank_index = max(0, min(rank_index, total - 1))
+    position_fraction = rank_index / total
+    cumulative = 0.0
+    last_label, last_color = TIER_SPECS[-1][0], TIER_SPECS[-1][1]
+    for label, color, weight in TIER_SPECS:
+        cumulative += weight / TIER_TOTAL_WEIGHT
+        if position_fraction < cumulative:
+            return (label, color)
+    return (last_label, last_color)
+
+
+def compute_rank_context(album_id:str) -> Dict[str, object]:
+    rows = _rank_rows()
+    total = len(rows)
+    rank_idx = next((i for i,(aid, _) in enumerate(rows) if aid == album_id), None)
+    if rank_idx is None:
+        return {"rank": None, "total": total, "tier": None, "tier_color": None}
+    tier_label, tier_color = tier_for_rank(rank_idx, total)
+    return {
+        "rank": rank_idx + 1,
+        "total": total,
+        "tier": tier_label,
+        "tier_color": tier_color
+    }
+
+
+def _render_tier_badge(label:str, color:str, *, size:int, font_size:str, radius:str="8px", class_name:str="tier-badge") -> html.Div:
+    style = {
+        "display": "flex",
+        "alignItems": "center",
+        "justifyContent": "center",
+        "width": f"{size}px",
+        "height": f"{size}px",
+        "borderRadius": radius,
+        "border": f"2px solid {color}",
+        "color": color,
+        "fontWeight": 700,
+        "fontSize": font_size,
+        "textTransform": "uppercase",
+        "letterSpacing": "0.05em",
+        "background": "transparent"
+    }
+    return html.Div(label, className=class_name, style=style)
+
+
+def render_rank_summary(rank_info:Dict[str, object]) -> html.Div:
+    rank = rank_info.get("rank") if rank_info else None
+    total = rank_info.get("total") if rank_info else None
+    tier = rank_info.get("tier") if rank_info else None
+    tier_color = rank_info.get("tier_color") if rank_info else None
+    tier_label = tier or "?"
+    badge_color = tier_color or "#6f7782"
+    rank_text = str(rank) if rank else "?"
+    total_text = str(total) if total else "?"
+    badge_size = 54
+    badge = _render_tier_badge(tier_label, badge_color, size=badge_size, font_size="1.6rem", radius="10px")
+    return html.Div([
+        badge,
+        html.Div([
+            html.Span(rank_text, className="rank-number"),
+            html.Span("/", className="rank-separator"),
+            html.Span(total_text, className="rank-total")
+        ], className="rank-row", style={
+            "width": f"{badge_size}px",
+            "display": "flex",
+            "alignItems": "center",
+            "justifyContent": "space-between",
+            "fontSize": "0.85rem",
+            "fontWeight": "600"
+        })
+    ], className="rank-summary")
 
 # Search index
 def build_search_index():
@@ -456,6 +553,12 @@ def top_nav():
                 className="nav-albums-link direct-link",
                 style={"textDecoration":"none", "display":"inline-block", "padding":"0", "margin":"0"}
             ),
+            html.A(
+                dbc.Button("Tierlist", color="secondary", className="me-2", id="tierlist-btn"),
+                href="/tierlist",
+                className="nav-tierlist-link direct-link",
+                style={"textDecoration":"none", "display":"inline-block", "padding":"0", "margin":"0"}
+            ),
             # Settings button (gear icon) - appears next to Home
             html.A(
                 dbc.Button("⚙", color="secondary", className="me-2", id="settings-btn", title="Settings"),
@@ -481,6 +584,8 @@ def album_card_line(result):
     title_children = highlight_match(a["album_name"], q) if q else a["album_name"]
     artist_children = highlight_match(a["artists"], q) if q else a["artists"]
 
+    year_text = a.get("year") or ""
+
     return dbc.ListGroupItem(
         dbc.Row([
             dbc.Col(html.Img(src=img_uri, style={"height":"48px", "width":"48px", "borderRadius":"6px"}), width="auto"),
@@ -489,7 +594,11 @@ def album_card_line(result):
                 html.Div(artist_children, className="search-sub"),
                 html.Div(result["why"], className="why-pill"),
             ]),
-            dbc.Col(html.Div(a.get("year") or "", className="search-year"), width=2, style={"textAlign":"right"})
+            dbc.Col(
+                html.Span(year_text, className="search-year"),
+                width=2,
+                style={"textAlign":"right"}
+            )
         ], className="align-items-center"),
         action=True,
         href=f"/album/{a['album_id']}",
@@ -624,6 +733,12 @@ def render_albums_table(sort_state:dict):
     sort_col = (sort_state or {}).get("col","album")
     asc = (sort_state or {}).get("asc", True)
     rows, rank_map = _compute_all_album_stats()
+    rank_rows = _rank_rows()
+    tier_map = {}
+    total_ranked = len(rank_rows)
+    for idx, (aid_rank, _mean) in enumerate(rank_rows):
+        tier_label, _tier_color = tier_for_rank(idx, total_ranked)
+        tier_map[aid_rank] = tier_label or "—"
     # rows: (aid, name, artists, mv, dur_ms, c, fully)
     # Sorting key mapping (within group)
     def inner_sort_key(r):
@@ -663,6 +778,7 @@ def render_albums_table(sort_state:dict):
             rk = rank_map.get(aid) if fully else None
             pill = html.Span(str(rk), className="rank-pill") if rk else ""
             rating_cell = html.Span([f"{mv:.2f}", pill])
+        tier_label = tier_map.get(aid, "—") if fully else "—"
         body_trs.append(html.Tr([
             html.Td(idx),
             html.Td(html.Div([
@@ -671,6 +787,7 @@ def render_albums_table(sort_state:dict):
             ], className="album-cell")),
             html.Td(artists),
             html.Td(rating_cell),
+            html.Td(tier_label),
             html.Td(_format_album_duration(dur_ms))
         ]))
     # Header arrows
@@ -684,6 +801,7 @@ def render_albums_table(sort_state:dict):
         hdr("Album","album"),
         hdr("Artist","artist"),
         hdr("Rating","rating"),
+        html.Th("Tier"),
         hdr("Duration","dur_total")
     ]))
     table = html.Table([
@@ -711,16 +829,111 @@ def layout_settings():
         id="mean-mode-switch",
         switch=True,
     )
+    per_row_dropdown = dcc.Dropdown(
+        options=[{"label": str(opt), "value": opt} for opt in TIERLIST_ROW_OPTIONS],
+        value=TIERLIST_ALBUMS_PER_ROW,
+        id="tierlist-per-row-dropdown",
+        clearable=False,
+        style={"width": "220px"}
+    )
+    thumb_switch = dbc.Checklist(
+        options=[{"label": "Use 256×256 thumbnails (otherwise 64×64)", "value": "large"}],
+        value=["large"] if TIERLIST_USE_LARGE_THUMBS else [],
+        id="tierlist-thumb-switch",
+        switch=True,
+    )
     return html.Div([
         top_nav(),
         dbc.Container([
             html.H3("Settings"),
-            html.Div(switch, className="mb-2"),
-            html.Div("Toggle to switch the album rating mean calculation.", className="muted"),
+            html.Div([
+                html.Label("Album mean calculation", className="form-label"),
+                switch,
+                html.Div("Toggle to switch the album rating mean calculation.", className="muted")
+            ], className="mb-4"),
+            html.Div([
+                html.Label("Tierlist albums per row", className="form-label"),
+                per_row_dropdown,
+                html.Div("Controls how many album thumbnails appear in each tier row.", className="muted")
+            ], className="mb-4"),
+            html.Div([
+                html.Label("Tierlist thumbnail size", className="form-label"),
+                thumb_switch,
+                html.Div("Switch off to use compact 64×64 thumbnails.", className="muted")
+            ], className="mb-4"),
             # hidden sink for side-effect callback
             html.Div(id="settings-status", style={"display":"none"})
         ], fluid=True)
     ])
+
+
+def layout_tierlist():
+    rows = _rank_rows()
+    total = len(rows)
+    per_row = TIERLIST_ALBUMS_PER_ROW or 1
+    per_row = max(1, min(per_row, max(TIERLIST_ROW_OPTIONS)))
+    thumb_dim = 256 if TIERLIST_USE_LARGE_THUMBS else 64
+    grid_style = {
+        "display": "grid",
+        "gridTemplateColumns": f"repeat({per_row}, minmax(0, 1fr))",
+        "gap": "2px",
+        "justifyItems": "center",
+        "padding": "3px 4px"
+    }
+
+    if total == 0:
+        tier_rows = [html.Div("No fully ranked albums yet. Update ranks to populate tiers.", className="muted tierlist-empty")]
+    else:
+        tier_group_map = {label: [] for label, _color, _weight in TIER_SPECS}
+        for idx, (aid, _mean) in enumerate(rows):
+            tier_label, _tier_color = tier_for_rank(idx, total)
+            if tier_label is None:
+                continue
+            tier_group_map.setdefault(tier_label, []).append(aid)
+
+        tier_rows = []
+        thumb_size = (thumb_dim, thumb_dim)
+        for label, color, _weight in TIER_SPECS:
+            album_ids = tier_group_map.get(label, [])
+            album_cells = []
+            for aid in album_ids:
+                alb = ALBUMS.get(aid)
+                if not alb:
+                    continue
+                cover_path = Path(alb.get("cover_png", ""))
+                if not cover_path.exists():
+                    continue
+                thumb_path = get_or_make_thumb(cover_path, thumb_size)
+                img_uri = image_to_data_uri(thumb_path)
+                album_cells.append(
+                    html.Div(
+                        html.A(
+                            html.Img(src=img_uri, className="tierlist-album-image", style={"width": "100%"}),
+                            href=f"/album/{aid}",
+                            className="tierlist-album-link direct-link",
+                            style={"textDecoration": "none"}
+                        ),
+                        className="tierlist-album-item"
+                    )
+                )
+            if not album_cells:
+                content = html.Div("No albums in this tier yet.", className="muted tierlist-empty-tier")
+            else:
+                content = html.Div(album_cells, className="tierlist-album-grid", style=grid_style)
+
+            tier_rows.append(
+                html.Div([
+                    html.Div(label, className="tierlist-label"),
+                    content
+                ], className="tierlist-row", style={"--tier-color": color})
+            )
+
+    return html.Div([
+        top_nav(),
+        dbc.Container([
+            html.Div(tier_rows, className="tierlist-rows")
+        ], fluid=True)
+    ], className="tierlist-page")
 
 # --- Shuffle callback for unrated picks ---
 @app.callback(
@@ -766,6 +979,8 @@ def layout_search(results:List[dict]):
         title_children = highlight_match(a["album_name"], q) if q else a["album_name"]
         artist_children = highlight_match(a["artists"], q) if q else a["artists"]
 
+        year_text = a.get("year") or ""
+
         search_items.append(
             html.Div(
                 dbc.Card(
@@ -777,7 +992,11 @@ def layout_search(results:List[dict]):
                                 html.Div(artist_children, className="search-sub"),
                                 html.Div(r["why"], className="why-pill"),
                             ]),
-                            dbc.Col(html.Div(a.get("year") or "", className="search-year"), width=2, style={"textAlign":"right"})
+                            dbc.Col(
+                                html.Span(year_text, className="search-year"),
+                                width=2,
+                                style={"textAlign":"right"}
+                            )
                         ], className="align-items-center"),
                     ]),
                     className="search-result-item mb-2",
@@ -994,22 +1213,6 @@ def album_ignore_strip(album_id:str, theme:Dict):
         )
     return html.Div(btns, className="d-flex flex-wrap")
 
-def render_rank_card(album_id:str):
-    """Return a rank card component for the given album id (no callbacks)."""
-    fully = _is_fully_rated(album_id)
-    r, total = compute_album_rank_single(album_id) if fully else (None, 0)
-    mode_label = "Duration-weighted" if MEAN_WEIGHTED else "Uniform"
-    value = f"{r}/{total}" if r is not None and total else "—"
-    return dbc.Card(
-        dbc.CardBody([
-            html.Table([
-                html.Thead(html.Tr([html.Th("Metric"), html.Th("Rank", style={"textAlign":"right"})])),
-                html.Tbody([
-                    html.Tr([html.Td(mode_label), html.Td(value, style={"textAlign":"right"})]),
-                ])
-            ], className="rank-table"),
-        ]), className="rank-card", id={"type":"rank-card","album":album_id})
-
 def accent_color_bar(theme:Dict):
     """Return a thick horizontal bar composed of 5 cover-derived colors.
     Uses theme['accents_bar'] (raw clustered colors) falling back gracefully."""
@@ -1047,11 +1250,19 @@ def layout_album(album_id:str):
         album_duration_str = f"{m}:{s:02d}"
 
     sel_mean, c = selected_album_mean(album_id)
-    rank_box = html.Div(id={"type":"rank-card-container","album":album_id}, children=[render_rank_card(album_id)])
+    rank_info = compute_rank_context(album_id)
+    rank_summary = render_rank_summary(rank_info)
     mode_label = "Mean (Duration)" if MEAN_WEIGHTED else "Mean (Uniform)"
     stat_cards = dbc.Row([
-        dbc.Col(dbc.Card(dbc.CardBody([html.H6(mode_label), html.H3(sel_mean if sel_mean is not None else "—", id={"type":"mean-selected","album":album_id})])), md=6),
-        dbc.Col(rank_box, md=6),
+        dbc.Col(dbc.Card(dbc.CardBody([
+            html.Div([
+                html.Div([
+                    html.H6(mode_label),
+                    html.H3(sel_mean if sel_mean is not None else "—", id={"type":"mean-selected","album":album_id})
+                ], className="flex-grow-1"),
+                html.Div(rank_summary, id={"type":"rank-display","album":album_id}, className="rank-display ms-auto")
+            ], className="d-flex align-items-center justify-content-between flex-wrap gap-3")
+        ])), md=6, lg=5),
     ], className="gy-2")
 
     tracks_table = dbc.Table(
@@ -1107,6 +1318,22 @@ def layout_album(album_id:str):
                     html.Div([
                         dbc.Button("Toggle Bar Widths", id={"type":"width-toggle","album":album_id}, color="secondary", size="sm", className="me-2"),
                         dbc.Button("Update Ranks", id={"type":"update-ranks","album":album_id}, color="secondary", size="sm", className="me-2"),
+                        # Listen button tries native Spotify first (handled via assets/listen.js) with web fallback.
+                        html.A(
+                            dbc.Button(
+                                "Listen",
+                                id={"type":"listen-album-btn","album":album_id},
+                                color="secondary",
+                                size="sm",
+                                className="me-2",
+                                title="Open in Spotify"
+                            ),
+                            href=f"spotify:album:{album_id}",
+                            className="direct-link",
+                            style={"textDecoration":"none"},
+                            **{"data-spotify-uri": f"spotify:album:{album_id}",
+                               "data-spotify-web": f"https://open.spotify.com/album/{album_id}"}
+                        ),
                         dbc.Button("Reset", id={"type":"reset-ratings","album":album_id}, color="warning", outline=True, size="sm", className="me-2"),
                     ], className="d-flex align-items-center flex-wrap gap-2 mb-2"),
                     svg_rating_component(album_id, theme),
@@ -1147,6 +1374,8 @@ def router(pathname:str):
         return [layout_home()]
     if pathname == "/albums":
         return [layout_albums()]
+    if pathname == "/tierlist":
+        return [layout_tierlist()]
     if pathname == "/settings":
         return [layout_settings()]
     if pathname.startswith("/album/"):
@@ -1327,15 +1556,28 @@ def manage_search_modal(is_open, pathname):
 @app.callback(
     Output("settings-status", "children"),
     Input("mean-mode-switch", "value"),
+    Input("tierlist-per-row-dropdown", "value"),
+    Input("tierlist-thumb-switch", "value"),
     prevent_initial_call=False
 )
-def apply_mean_mode_switch(values):
+def apply_settings(values, per_row, thumb_values):
+    global MEAN_WEIGHTED, TIERLIST_ALBUMS_PER_ROW, TIERLIST_USE_LARGE_THUMBS
     # values is a list containing 'uniform' when switch is on
-    global MEAN_WEIGHTED
     want_uniform = isinstance(values, list) and ("uniform" in values)
     MEAN_WEIGHTED = not want_uniform
-    # return a small status string for visibility in dev tools if needed
-    return "uniform" if want_uniform else "weighted"
+
+    if per_row is not None:
+        try:
+            per_row_int = int(per_row)
+            if per_row_int in TIERLIST_ROW_OPTIONS:
+                TIERLIST_ALBUMS_PER_ROW = per_row_int
+        except (TypeError, ValueError):
+            pass
+
+    use_large = isinstance(thumb_values, list) and ("large" in thumb_values)
+    TIERLIST_USE_LARGE_THUMBS = use_large
+
+    return f"mode={'uniform' if want_uniform else 'weighted'}, per_row={TIERLIST_ALBUMS_PER_ROW}, thumb={'256' if use_large else '64'}"
 
 @app.callback(
     Output({"type":"album-widths","album":MATCH}, "data"),
@@ -1453,7 +1695,7 @@ def update_widths(width_state, ratings, ignored, theme_state):
     return children
 
 @app.callback(
-    Output({"type":"rank-card-container","album":MATCH}, "children"),
+    Output({"type":"rank-display","album":MATCH}, "children"),
     Output({"type":"mean-selected","album":MATCH}, "children"),
     Input({"type":"update-ranks","album":MATCH}, "n_clicks"),
     prevent_initial_call=True
@@ -1466,7 +1708,8 @@ def update_ranks(n_clicks):
     # Recompute stats
     sel_mean, c = selected_album_mean(album_id)
     sel_disp = sel_mean if sel_mean is not None else "—"
-    return [render_rank_card(album_id)], sel_disp
+    rank_info = compute_rank_context(album_id)
+    return render_rank_summary(rank_info), sel_disp
 
 @app.callback(
     Output("delete-modal", "is_open"),
