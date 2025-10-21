@@ -13,6 +13,7 @@ import dash_bootstrap_components as dbc
 from dash_extensions import EventListener
 from dash_svg import Svg, Line, Text, Rect, Polyline, Polygon
 from bisect import bisect_right as _br
+import spotify_album_harvest    
 
 # --------- Config / Paths ----------
 DATA_DIR = Path("output_spotify")         # where albums.json & images/ live
@@ -554,9 +555,21 @@ def top_nav():
                 style={"textDecoration":"none", "display":"inline-block", "padding":"0", "margin":"0"}
             ),
             html.A(
+                dbc.Button("Artists", color="secondary", className="me-2", id="artists-btn"),
+                href="/artists",
+                className="nav-artists-link direct-link",
+                style={"textDecoration":"none", "display":"inline-block", "padding":"0", "margin":"0"}
+            ),
+            html.A(
                 dbc.Button("Tierlist", color="secondary", className="me-2", id="tierlist-btn"),
                 href="/tierlist",
                 className="nav-tierlist-link direct-link",
+                style={"textDecoration":"none", "display":"inline-block", "padding":"0", "margin":"0"}
+            ),
+            html.A(
+                dbc.Button("Hist", color="secondary", className="me-2", id="album-hist-btn"),
+                href="/album-hist",
+                className="nav-album-hist-link direct-link",
                 style={"textDecoration":"none", "display":"inline-block", "padding":"0", "margin":"0"}
             ),
             # Settings button (gear icon) - appears next to Home
@@ -614,7 +627,11 @@ def home_stats(theme):
     # stats
     n_albums = len(ALL_ALBUMS)
     total_tracks = sum(len(a["tracks"]) for a in ALL_ALBUMS)
-    avg_len_min = round(np.mean([album_duration_ms(a)/60000 for a in ALL_ALBUMS]), 2) if n_albums else 0
+    durations_min = []
+    for a in ALL_ALBUMS:
+        dur_ms = album_effective_duration_ms(a["album_id"])
+        durations_min.append((dur_ms/60000) if dur_ms else 0)
+    avg_len_min = round(float(np.mean(durations_min)), 2) if durations_min else 0
     avg_tracks = round(np.mean([len(a["tracks"]) for a in ALL_ALBUMS]), 2) if n_albums else 0
     total_rated = 0
     # Ensure RATINGS loaded for each album on demand
@@ -693,7 +710,22 @@ def layout_home():
     theme = DEFAULT_THEME
     return html.Div([
         top_nav(),
-        dbc.Container(id="home-body", children=[home_stats(theme)], fluid=True)
+        dbc.Container(
+            id="home-body",
+            children=[
+                html.Div([
+                    dbc.Button(
+                        "collect great albums",
+                        id="collect-albums-btn",
+                        color="primary",
+                        className="mb-2"
+                    ),
+                    html.Div(id="collect-albums-status")
+                ], className="mb-4"),
+                home_stats(theme)
+            ],
+            fluid=True
+        )
     ])
 
 def _is_fully_rated(aid:str) -> bool:
@@ -705,12 +737,36 @@ def _is_fully_rated(aid:str) -> bool:
             return False
     return True
 
+
+def album_effective_duration_ms(album_id:str) -> int:
+    alb = ALBUMS.get(album_id)
+    if not alb:
+        return 0
+    ensure_rating_struct(album_id)
+    ignored = RATINGS[album_id]["ignored"]
+    total = 0
+    tracks = alb.get("tracks", [])
+    for idx, tr in enumerate(tracks):
+        if idx < len(ignored) and ignored[idx]:
+            continue
+        total += tr.get("duration_ms") or 0
+    return total
+
+
+def _split_artists(artist_field:str) -> List[str]:
+    field = artist_field or ""
+    if ";" in field:
+        parts = field.split(";")
+    else:
+        parts = field.split(",")
+    return [name.strip() for name in parts if name.strip()]
+
 def _compute_all_album_stats():
     # rows: (album_id, album_name, artists, sel_mean, duration_ms, rated_count, fully)
     rows = []
     for aid, alb in ALBUMS.items():
         mv, c = selected_album_mean(aid)
-        dur_ms = sum(t.get("duration_ms") or 0 for t in alb["tracks"])
+        dur_ms = album_effective_duration_ms(aid)
         fully = _is_fully_rated(aid)
         rows.append((aid, alb["album_name"], alb["artists"], mv, dur_ms, c, fully))
     # Ranks only among fully rated albums with at least one rated non-ignored track and value not None
@@ -718,6 +774,93 @@ def _compute_all_album_stats():
     rated.sort(key=lambda x: x[1], reverse=True)
     rank_map = {aid: i+1 for i,(aid,_) in enumerate(rated)}
     return rows, rank_map
+
+
+def _compute_artist_stats():
+    data: Dict[str, Dict[str, object]] = {}
+    for alb in ALL_ALBUMS:
+        aid = alb["album_id"]
+        ensure_rating_struct(aid)
+        ratings = RATINGS[aid]["ratings"]
+        ignored = RATINGS[aid]["ignored"]
+        sel_mean, rated_count = selected_album_mean(aid)
+        album_has_rating = rated_count > 0 and sel_mean is not None
+        # split artists (allow semicolon-separated lists). Keep artists as provided and normalize later.
+        raw_artists = _split_artists(alb.get("artists", ""))
+        artists = raw_artists if raw_artists else ["Unknown"]
+
+        track_ratings = []
+        track_duration_ms = 0
+        for idx, track in enumerate(alb.get("tracks", [])):
+            if idx < len(ignored) and ignored[idx]:
+                continue
+            track_duration_ms += track.get("duration_ms") or 0
+            if idx < len(ratings):
+                val = ratings[idx]
+                if val is not None:
+                    track_ratings.append(val)
+
+        for artist in artists:
+            # normalize artist key to avoid minor variants (whitespace/case)
+            key = re.sub(r"\s+", " ", artist.strip())
+            entry = data.setdefault(key, {
+                "album_ids": set(),
+                "rated_album_ids": set(),
+                "album_rating_values": [],
+                "track_ratings": [],
+                "duration_ms": 0,
+                "top_album": None,  # (rating, album_id)
+                "longest_album": None,  # (duration_ms, album_id)
+            })
+            entry["album_ids"].add(aid)
+            if album_has_rating:
+                entry["rated_album_ids"].add(aid)
+                entry["album_rating_values"].append(sel_mean)
+                top = entry["top_album"]
+                if (top is None) or (sel_mean > top[0]):
+                    entry["top_album"] = (sel_mean, aid)
+                elif sel_mean == top[0] and top[1] is None:
+                    entry["top_album"] = (sel_mean, aid)
+            entry["track_ratings"].extend(track_ratings)
+            entry["duration_ms"] += track_duration_ms
+            longest = entry["longest_album"]
+            if (longest is None) or (track_duration_ms > longest[0]):
+                entry["longest_album"] = (track_duration_ms, aid)
+
+    rows = []
+    for artist, entry in data.items():
+        album_ids = entry["album_ids"]
+        rated_album_ids = entry["rated_album_ids"]
+        album_rating_values = entry["album_rating_values"]
+        track_rating_values = entry["track_ratings"]
+        duration_ms = entry["duration_ms"]
+        top_album = entry["top_album"]
+        longest_album = entry["longest_album"]
+
+        avg_album_rating = float(np.mean(album_rating_values)) if album_rating_values else None
+        top_album_rating = top_album[0] if top_album else None
+        top_album_id = None
+        if top_album:
+            top_album_id = top_album[1]
+        elif longest_album:
+            top_album_id = longest_album[1]
+        mean_track_rating = float(np.mean(track_rating_values)) if track_rating_values else None
+        std_track_rating = float(np.std(track_rating_values)) if track_rating_values else None
+
+        rows.append({
+            "artist": artist,
+            "album_count": len(album_ids),
+            "rated_album_count": len(rated_album_ids),
+            "avg_album_rating": avg_album_rating,
+            "top_album_rating": top_album_rating,
+            "mean_track_rating": mean_track_rating,
+            "track_rating_std": std_track_rating,
+            "duration_ms": duration_ms,
+            "top_album_id": top_album_id,
+        })
+
+    rows.sort(key=lambda r: r["artist"].lower())
+    return rows
 
 def _format_album_duration(ms:int) -> str:
     secs = ms//1000
@@ -728,6 +871,7 @@ def _format_album_duration(ms:int) -> str:
 # Default sort: Rating high -> low.
 # Note: For rating column the code interprets asc=True as reverse sort (high-to-low).
 ALBUM_TABLE_SORT_DEFAULT = {"col":"rating","asc":True}
+ARTIST_TABLE_SORT_DEFAULT = {"col":"avg_album_rating","asc":True}
 
 def render_albums_table(sort_state:dict):
     sort_col = (sort_state or {}).get("col","album")
@@ -741,30 +885,46 @@ def render_albums_table(sort_state:dict):
         tier_map[aid_rank] = tier_label or "—"
     # rows: (aid, name, artists, mv, dur_ms, c, fully)
     # Sorting key mapping (within group)
+    # Helper: place missing values last (is_missing=True)
+    tier_order = {label: i for i, (label, _c, _w) in enumerate(TIER_SPECS)}
+
+    def _string_primary(s: str):
+        s = (s or "").lower()
+        return s if asc else tuple(-ord(ch) for ch in s)
+
+    def _num_primary(v):
+        # for numeric columns: asc True => high->low by using -v as primary so larger v sorts earlier
+        if v is None:
+            return 0
+        return -v if asc else v
+
     def inner_sort_key(r):
         aid, name, artists, mv, dur_ms, c, fully = r
         if sort_col == "album":
-            return name.lower()
+            return (False, _string_primary(name))
         if sort_col == "artist":
-            return artists.lower()
+            return (False, _string_primary(artists))
         if sort_col == "rating":
-            return -1e9 if mv is None else mv
+            is_missing = mv is None
+            return (is_missing, _num_primary(mv))
         if sort_col == "dur_total":
-            return dur_ms
-        return name.lower()
-    # For rating columns asc=True => high->low; for others asc=True => low->high
-    if sort_col in ("rating",):
-        def transform(seq):
-            return sorted(seq, key=inner_sort_key, reverse=True if asc else False)
-    else:
-        def transform(seq):
-            return sorted(seq, key=inner_sort_key, reverse=False if asc else True)
+            is_missing = dur_ms is None
+            return (is_missing, _num_primary(dur_ms))
+        if sort_col == "tier":
+            lab = tier_map.get(aid)
+            is_missing = (lab is None or lab == "—")
+            idx = tier_order.get(lab, 999)
+            return (is_missing, idx if asc else -idx)
+        return (False, _string_primary(name))
     # Separate fully vs partial
-    fully_rows = [r for r in rows if r[6]]
-    partial_rows = [r for r in rows if not r[6]]
-    fully_sorted = transform(fully_rows)
-    partial_sorted = transform(partial_rows)
-    rows_sorted = fully_sorted + partial_sorted
+    rated_rows = [r for r in rows if r[6]]
+    unrated_rows = [r for r in rows if not r[6]]
+    if sort_col in ("rating", "tier"):
+        rated_sorted = sorted(rated_rows, key=inner_sort_key)
+        unrated_sorted = sorted(unrated_rows, key=inner_sort_key)
+        rows_sorted = rated_sorted + unrated_sorted
+    else:
+        rows_sorted = sorted(rows, key=inner_sort_key)
     # Recompute index numbering based on sorted list
     body_trs = []
     for idx, (aid, name, artists, mv, dur_ms, c, fully) in enumerate(rows_sorted, start=1):
@@ -810,6 +970,98 @@ def render_albums_table(sort_state:dict):
     ], className="album-table")
     return table
 
+
+def render_artists_table(sort_state:dict):
+    sort_col = (sort_state or {}).get("col", "avg_album_rating")
+    asc = (sort_state or {}).get("asc", True)
+    rows = _compute_artist_stats()
+    # use same missing-last, numeric-high-to-low, string A->Z behavior as albums table
+    def _string_key(s: str):
+        return (s or "").lower()
+
+    def _num_key(v):
+        return (v is None, -v if v is not None else 0)
+
+    def inner_sort_key(row):
+        if sort_col == "artist":
+            return (False, _string_key(row["artist"]))
+        if sort_col == "album_count":
+            return _num_key(row["album_count"])
+        if sort_col == "rated_album_count":
+            return _num_key(row["rated_album_count"])
+        if sort_col == "avg_album_rating":
+            return _num_key(row["avg_album_rating"])
+        if sort_col == "top_album_rating":
+            return _num_key(row["top_album_rating"])
+        if sort_col == "mean_track_rating":
+            return _num_key(row["mean_track_rating"])
+        if sort_col == "track_rating_std":
+            return _num_key(row["track_rating_std"])
+        if sort_col == "duration":
+            return _num_key(row["duration_ms"])
+        return (False, _string_key(row["artist"]))
+
+    rows_sorted = sorted(rows, key=inner_sort_key)
+    if not asc:
+        rows_sorted.reverse()
+
+    body_trs = []
+    for idx, row in enumerate(rows_sorted, start=1):
+        thumb_children = []
+        top_album_id = row.get("top_album_id")
+        if top_album_id:
+            alb = ALBUMS.get(top_album_id)
+            if alb:
+                cover_path = Path(alb.get("cover_png", ""))
+                if cover_path.exists():
+                    thumb = get_or_make_thumb(cover_path, (64,64))
+                    img_uri = image_to_data_uri(thumb)
+                    thumb_children.append(html.Img(src=img_uri, style={"width":"42px","height":"42px","objectFit":"cover"}))
+
+        artist_cell = html.Div([
+            *thumb_children,
+            html.Span(row["artist"], className="artist-name ms-2" if thumb_children else "artist-name")
+        ], className="album-cell")
+
+        def fmt(val):
+            return "—" if val is None else f"{val:.2f}"
+
+        body_trs.append(html.Tr([
+            html.Td(idx),
+            html.Td(artist_cell),
+            html.Td(row["album_count"]),
+            html.Td(row["rated_album_count"]),
+            html.Td(fmt(row["avg_album_rating"])),
+            html.Td(fmt(row["top_album_rating"])),
+            html.Td(fmt(row["mean_track_rating"])),
+            html.Td(fmt(row["track_rating_std"])),
+            html.Td(_format_album_duration(row["duration_ms"]))
+        ]))
+
+    def hdr(label, col_key):
+        arrow = ""
+        if sort_col == col_key:
+            arrow = " ▲" if asc else " ▼"
+        return html.Th(label + arrow, id={"type":"artists-header","col":col_key})
+
+    thead = html.Thead(html.Tr([
+        hdr("#", "index"),
+        hdr("Artist", "artist"),
+        hdr("No. Albums", "album_count"),
+        hdr("No. Rated Albums", "rated_album_count"),
+        hdr("Avg. Album Rating", "avg_album_rating"),
+        hdr("Top Album Rating", "top_album_rating"),
+        hdr("Mean Track Rating", "mean_track_rating"),
+        hdr("Track Rating Std.", "track_rating_std"),
+        hdr("Duration", "duration")
+    ]))
+
+    table = html.Table([
+        thead,
+        html.Tbody(body_trs)
+    ], className="album-table")
+    return table
+
 def layout_albums():
     return html.Div([
         top_nav(),
@@ -817,6 +1069,17 @@ def layout_albums():
             html.H3("Albums"),
             dcc.Store(id="albums-sort", data=ALBUM_TABLE_SORT_DEFAULT),
             html.Div(id="albums-table-container", children=[render_albums_table(ALBUM_TABLE_SORT_DEFAULT)])
+        ], fluid=True)
+    ])
+
+
+def layout_artists():
+    return html.Div([
+        top_nav(),
+        dbc.Container([
+            html.H3("Artists"),
+            dcc.Store(id="artists-sort", data=ARTIST_TABLE_SORT_DEFAULT),
+            html.Div(id="artists-table-container", children=[render_artists_table(ARTIST_TABLE_SORT_DEFAULT)])
         ], fluid=True)
     ])
 
@@ -934,6 +1197,279 @@ def layout_tierlist():
             html.Div(tier_rows, className="tierlist-rows")
         ], fluid=True)
     ], className="tierlist-page")
+
+###############################
+# Album Histogram Page Helpers
+###############################
+
+HIST_SVG_W, HIST_SVG_H = 1200, 500
+HIST_MARGIN_L, HIST_MARGIN_R, HIST_MARGIN_T, HIST_MARGIN_B = 40, 40, 40, 70
+HIST_PLOT_W = HIST_SVG_W - HIST_MARGIN_L - HIST_MARGIN_R
+HIST_PLOT_H = HIST_SVG_H - HIST_MARGIN_T - HIST_MARGIN_B
+
+HIST_EVENTS = [
+    {"event": "pointermove",  "props": ["type", "offsetX", "offsetY", "buttons"]},
+    {"event": "pointerleave", "props": ["type", "offsetX", "offsetY", "buttons"]},
+    {"event": "pointerdown",  "props": ["type", "offsetX", "offsetY", "buttons"]}
+]
+
+HIST_TOOLTIP_BASE_STYLE = {
+    "position": "absolute",
+    "display": "none",
+    "pointerEvents": "none",
+    "background": "rgba(12,15,20,0.96)",
+    "border": "1px solid #2a2f36",
+    "borderRadius": "10px",
+    "padding": "12px",
+    "color": "#dfe2e7",
+    "minWidth": "260px",
+    "maxWidth": "320px",
+    "boxShadow": "0 8px 20px rgba(0,0,0,0.45)",
+    "zIndex": 10
+}
+
+def _collect_histogram_rows() -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    rank_rows = _rank_rows()
+    rank_map = {aid: idx for idx, (aid, _mean) in enumerate(rank_rows)}
+    total_ranked = len(rank_rows)
+    for aid, alb in ALBUMS.items():
+        mean_val, count = selected_album_mean(aid)
+        if mean_val is None or count == 0:
+            continue
+        tier_label, tier_color = (None, None)
+        if aid in rank_map:
+            tier_label, tier_color = tier_for_rank(rank_map[aid], total_ranked)
+        tier_label = tier_label or "—"
+        tier_color = tier_color or "#3a4651"
+        cover_path = Path(alb.get("cover_png", ""))
+        thumb_src = ""
+        try:
+            if cover_path.exists():
+                thumb_path = get_or_make_thumb(cover_path, (96, 96))
+                thumb_src = image_to_data_uri(thumb_path)
+        except Exception:
+            thumb_src = ""
+        rows.append({
+            "album_id": aid,
+            "mean": float(mean_val),
+            "name": alb.get("album_name", "Unknown Album"),
+            "artists": alb.get("artists", ""),
+            "tier": tier_label,
+            "tier_color": tier_color,
+            "thumb": thumb_src
+        })
+    rows.sort(key=lambda r: r["mean"], reverse=True)
+    return rows
+
+def _build_album_histogram_svg(rows: List[Dict[str, object]], theme: Dict) -> Tuple[List, Dict[str, object]]:
+    if not rows:
+        return [], {}
+    values = np.array([r["mean"] for r in rows], dtype=float)
+    min_val = float(values.min())
+    max_val = float(values.max())
+    span = max_val - min_val
+    if span <= 0:
+        span = 1.0
+    pad = 0.05 * span
+    domain_l = min_val - pad
+    domain_r = max_val + pad
+    if domain_r <= domain_l:
+        domain_r = domain_l + 1.0
+
+    n_bins = 20
+    bin_width = (domain_r - domain_l) / n_bins
+    bins: List[List[Dict[str, object]]] = [[] for _ in range(n_bins)]
+    for row in rows:
+        idx = 0 if bin_width <= 0 else int((row["mean"] - domain_l) / bin_width)
+        if idx < 0:
+            idx = 0
+        elif idx >= n_bins:
+            idx = n_bins - 1
+        bins[idx].append(row)
+    for bucket in bins:
+        bucket.sort(key=lambda r: r["mean"], reverse=True)
+    max_count = max([len(bucket) for bucket in bins] + [1])
+    unit = HIST_PLOT_H / max_count
+    vertical_gap_px = min(unit * 0.035, 6.0)
+    horizontal_gap_ratio = 0.2 / 3.0
+    accents = theme.get("accents", DEFAULT_THEME["accents"])
+
+    def _x_to_px(val: float) -> float:
+        return HIST_MARGIN_L + (val - domain_l) * (HIST_PLOT_W / (domain_r - domain_l))
+
+    svg_children: List = []
+    svg_children.append(Rect(
+        x=HIST_MARGIN_L,
+        y=HIST_MARGIN_T,
+        width=HIST_PLOT_W,
+        height=HIST_PLOT_H,
+        fill=theme.get("bg_dark", DEFAULT_THEME["bg_dark"]),
+        stroke="#1e252d",
+        strokeWidth=2
+    ))
+
+    # Horizontal grid / y-axis labels
+    for tick in range(0, max_count + 1):
+        y = HIST_MARGIN_T + HIST_PLOT_H - tick * unit
+        svg_children.append(Line(
+            x1=HIST_MARGIN_L,
+            y1=y,
+            x2=HIST_MARGIN_L + HIST_PLOT_W,
+            y2=y,
+            stroke="#29333b",
+            strokeWidth=1,
+            style={"pointerEvents": "none", "opacity": 0.4 if tick else 0.9}
+        ))
+        svg_children.append(Text(
+            str(tick),
+            x=HIST_MARGIN_L - 14,
+            y=y + 4,
+            fill="#a6b2bd",
+            textAnchor="end",
+            style={"fontSize": "13px", "pointerEvents": "none"}
+        ))
+
+    # Axis lines
+    svg_children.append(Line(
+        x1=HIST_MARGIN_L,
+        y1=HIST_MARGIN_T,
+        x2=HIST_MARGIN_L,
+        y2=HIST_MARGIN_T + HIST_PLOT_H,
+        stroke="#4b5662",
+        strokeWidth=2
+    ))
+    svg_children.append(Line(
+        x1=HIST_MARGIN_L,
+        y1=HIST_MARGIN_T + HIST_PLOT_H,
+        x2=HIST_MARGIN_L + HIST_PLOT_W,
+        y2=HIST_MARGIN_T + HIST_PLOT_H,
+        stroke="#4b5662",
+        strokeWidth=2
+    ))
+
+    tick_step = 0.2
+    tick_start = math.ceil(domain_l / tick_step) * tick_step
+    ticks = []
+    t = tick_start
+    while t <= domain_r + 1e-9:
+        ticks.append(round(t, 10))
+        t += tick_step
+    for tick in ticks:
+        px = _x_to_px(tick)
+        svg_children.append(Line(
+            x1=px,
+            y1=HIST_MARGIN_T + HIST_PLOT_H,
+            x2=px,
+            y2=HIST_MARGIN_T + HIST_PLOT_H + 12,
+            stroke="#4b5662",
+            strokeWidth=1.3
+        ))
+        svg_children.append(Text(
+            f"{tick:.1f}".rstrip("0").rstrip("."),
+            x=px,
+            y=HIST_MARGIN_T + HIST_PLOT_H + 34,
+            fill="#aab4bf",
+            textAnchor="middle",
+            style={"fontSize": "12px", "pointerEvents": "none"}
+        ))
+
+    rect_meta: List[Dict[str, float]] = []
+    album_payload: Dict[str, Dict[str, object]] = {}
+
+    for bin_idx, bucket in enumerate(bins):
+        bin_left_val = domain_l + bin_idx * bin_width
+        bin_right_val = bin_left_val + bin_width
+        bar_left = _x_to_px(bin_left_val)
+        bar_right = _x_to_px(bin_right_val)
+        bin_width_px = bar_right - bar_left
+        h_gap_px = bin_width_px * horizontal_gap_ratio
+        bar_width = max(bin_width_px - h_gap_px, 2.0)
+        bar_left += h_gap_px / 2.0
+
+        y_bottom = HIST_MARGIN_T + HIST_PLOT_H
+        color_seed = bin_idx % len(accents)
+        for album in bucket:
+            rect_height = max(unit - vertical_gap_px, 4.0)
+            rect_y = y_bottom - rect_height
+            fill_color = album.get("tier_color") or accents[color_seed]
+            svg_children.append(Rect(
+                x=bar_left,
+                y=rect_y,
+                width=bar_width,
+                height=rect_height,
+                fill=fill_color,
+                stroke="#11161d",
+                strokeWidth=1,
+                style={"cursor": "pointer", "fillOpacity": 0.9}
+            ))
+            rect_meta.append({
+                "album_id": album["album_id"],
+                "x": bar_left,
+                "y": rect_y,
+                "width": bar_width,
+                "height": rect_height,
+                "mean": album["mean"]
+            })
+            if album["album_id"] not in album_payload:
+                album_payload[album["album_id"]] = {
+                    "name": album["name"],
+                    "artists": album["artists"],
+                    "mean": album["mean"],
+                    "tier": album["tier"],
+                    "tier_color": album["tier_color"],
+                    "thumb": album["thumb"]
+                }
+            y_bottom = rect_y - vertical_gap_px
+
+    store_data = {
+        "rects": rect_meta,
+        "albums": album_payload,
+        "svg": {"width": HIST_SVG_W, "height": HIST_SVG_H},
+        "domain": {"left": domain_l, "right": domain_r, "bin_width": bin_width}
+    }
+    return svg_children, store_data
+
+def _hist_find_rect(rects: List[Dict[str, float]], x: float, y: float) -> Optional[Dict[str, float]]:
+    for rect in rects:
+        if rect["x"] <= x <= rect["x"] + rect["width"] and rect["y"] <= y <= rect["y"] + rect["height"]:
+            return rect
+    return None
+
+def layout_album_hist():
+    rows = _collect_histogram_rows()
+    if not rows:
+        content = html.Div("No rated albums available yet. Rate albums to see the histogram.", className="album-hist-empty muted")
+    else:
+        svg_children, store_data = _build_album_histogram_svg(rows, DEFAULT_THEME)
+        content = html.Div([
+            dcc.Store(id="album-hist-geom", data=store_data),
+            EventListener(
+                id="album-hist-events",
+                events=HIST_EVENTS,
+                logging=False,
+                children=Svg(
+                    id="album-hist-svg",
+                    width=HIST_SVG_W,
+                    height=HIST_SVG_H,
+                    viewBox=f"0 0 {HIST_SVG_W} {HIST_SVG_H}",
+                    preserveAspectRatio="xMidYMid meet",
+                    style={
+                        "width": f"{HIST_SVG_W}px",
+                        "height": f"{HIST_SVG_H}px",
+                        "background": DEFAULT_THEME["bg_dark"],
+                        "userSelect": "none",
+                        "touchAction": "none"
+                    },
+                    children=svg_children
+                )
+            ),
+            html.Div(id="album-hist-tooltip", className="album-hist-tooltip", style=dict(HIST_TOOLTIP_BASE_STYLE))
+        ], className="album-hist-chart")
+    return html.Div([
+        top_nav(),
+        html.Div([content], className="album-hist-page")
+    ])
 
 # --- Shuffle callback for unrated picks ---
 @app.callback(
@@ -1240,7 +1776,7 @@ def layout_album(album_id:str):
 
     cover_big = image_to_data_uri(Path(alb["cover_png"]))
     # Compute total album duration in ms
-    total_ms = sum(t.get("duration_ms") or 0 for t in alb["tracks"])
+    total_ms = album_effective_duration_ms(album_id)
     secs = total_ms // 1000
     h, rem = divmod(secs, 3600)
     m, s = divmod(rem, 60)
@@ -1374,8 +1910,12 @@ def router(pathname:str):
         return [layout_home()]
     if pathname == "/albums":
         return [layout_albums()]
+    if pathname == "/artists":
+        return [layout_artists()]
     if pathname == "/tierlist":
         return [layout_tierlist()]
+    if pathname == "/album-hist":
+        return [layout_album_hist()]
     if pathname == "/settings":
         return [layout_settings()]
     if pathname.startswith("/album/"):
@@ -1383,6 +1923,24 @@ def router(pathname:str):
         if aid in ALBUMS: return [layout_album(aid)]
     # else treat as search (never reached in our links, but safe)
     return [layout_home()]
+
+@app.callback(
+    Output("collect-albums-status", "children"),
+    Input("collect-albums-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def trigger_collect_great_albums(n_clicks):
+    if not n_clicks:
+        return no_update
+    try:
+        spotify_album_harvest.main([])
+    except SystemExit as exc:
+        msg = f"Album harvest failed: {exc}"
+        return dbc.Alert(msg, color="danger", className="mt-2")
+    except Exception as exc:
+        msg = f"Album harvest failed: {exc}"
+        return dbc.Alert(msg, color="danger", className="mt-2")
+    return dbc.Alert("Album harvest complete.", color="success", className="mt-2")
 
 # Clear search box when navigating to an album so residual query doesn't interfere
 @app.callback(
@@ -1430,6 +1988,40 @@ def sort_albums(header_clicks, sort_state):
         else:
             new_state = {"col": col, "asc": True}  # standard ascending for text/duration
     table = render_albums_table(new_state)
+    return new_state, [table]
+
+
+@app.callback(
+    Output("artists-sort", "data"),
+    Output("artists-table-container", "children"),
+    Input({"type":"artists-header","col":ALL}, "n_clicks"),
+    State("artists-sort", "data"),
+    prevent_initial_call=True
+)
+def sort_artists(header_clicks, sort_state):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return dash.no_update, dash.no_update
+    trig = ctx.triggered[0]["prop_id"].split(".")[0]
+    try:
+        obj = json.loads(trig)
+    except Exception:
+        return dash.no_update, dash.no_update
+    col = obj.get("col")
+    if col is None:
+        return dash.no_update, dash.no_update
+    if col == "index":
+        col = "artist"
+    prev_col = (sort_state or {}).get("col", "avg_album_rating")
+    prev_asc = (sort_state or {}).get("asc", True)
+    if col == prev_col:
+        new_state = {"col": col, "asc": not prev_asc}
+    else:
+        if col in ("avg_album_rating", "top_album_rating", "mean_track_rating"):
+            new_state = {"col": col, "asc": True}
+        else:
+            new_state = {"col": col, "asc": True}
+    table = render_artists_table(new_state)
     return new_state, [table]
 
 # search as-you-type
@@ -1673,6 +2265,69 @@ def handle_pointer(n_events, evt, ratings, ignored, widths_state, theme_state):
         children = _render_svg_children(album_id, ratings, ignored, widths, [t["title"] for t in alb["tracks"]], theme)
         return ratings, ignored, children
     return ratings, ignored, no_update
+
+@app.callback(
+    Output("album-hist-tooltip", "children"),
+    Output("album-hist-tooltip", "style"),
+    Output("url", "pathname", allow_duplicate=True),
+    Input("album-hist-events", "n_events"),
+    State("album-hist-events", "event"),
+    State("album-hist-geom", "data"),
+    prevent_initial_call=True
+)
+def handle_album_hist_events(_n_events, evt, geom):
+    base_style = dict(HIST_TOOLTIP_BASE_STYLE)
+    if not evt or not geom:
+        return dash.no_update, base_style, dash.no_update
+    rect = None
+    rects = geom.get("rects") if isinstance(geom, dict) else None
+    x = evt.get("offsetX") if evt else None
+    y = evt.get("offsetY") if evt else None
+    if rects and x is not None and y is not None:
+        rect = _hist_find_rect(rects, float(x), float(y))
+    etype = evt.get("type") if evt else None
+    if etype == "pointerleave" or rect is None:
+        return html.Div(), base_style, dash.no_update
+    albums = geom.get("albums", {}) if isinstance(geom, dict) else {}
+    info = albums.get(rect.get("album_id"))
+    if not info:
+        return html.Div(), base_style, dash.no_update
+    thumb_src = info.get("thumb")
+    thumb_element = html.Img(src=thumb_src, className="album-hist-thumb") if thumb_src else html.Div("No art", className="album-hist-thumb album-hist-thumb--empty")
+    mean_val = info.get("mean")
+    mean_text = f"{mean_val:.2f}" if isinstance(mean_val, (int, float)) else "—"
+    tier_label = info.get("tier") or "—"
+    tier_color = info.get("tier_color") or "#dfe2e7"
+    tooltip_children = html.Div([
+        html.Div([
+            thumb_element,
+            html.Div([
+                html.Div(info.get("name", "Unknown Album"), className="album-hist-title"),
+                html.Div(info.get("artists", ""), className="album-hist-artist"),
+                html.Div([
+                    html.Span(f"Mean {mean_text}", className="album-hist-stat"),
+                    html.Span([
+                        "Tier ",
+                        html.Span(tier_label, className="album-hist-tier", style={"color": tier_color})
+                    ], className="album-hist-stat")
+                ], className="album-hist-stats")
+            ], className="album-hist-meta")
+        ], className="album-hist-tooltip-row")
+    ], className="album-hist-tooltip-inner")
+    svg_dim = geom.get("svg", {}) if isinstance(geom, dict) else {}
+    svg_w = float(svg_dim.get("width", HIST_SVG_W))
+    svg_h = float(svg_dim.get("height", HIST_SVG_H))
+    tooltip_width = 240.0
+    tooltip_height = 150.0
+    left = min(max(float(x) + 18.0, 8.0), svg_w - tooltip_width - 8.0)
+    top = min(max(float(y) + 18.0, 8.0), svg_h - tooltip_height - 8.0)
+    style = dict(HIST_TOOLTIP_BASE_STYLE)
+    style.update({"display": "block", "left": f"{left}px", "top": f"{top}px"})
+    navigate = dash.no_update
+    buttons = evt.get("buttons") if evt else None
+    if etype == "pointerdown" and buttons in (0, 1, None):
+        navigate = f"/album/{rect['album_id']}"
+    return tooltip_children, style, navigate
 
 @app.callback(
     Output({"type":"album-svg","album":MATCH}, "children", allow_duplicate=True),

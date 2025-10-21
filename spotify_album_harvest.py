@@ -17,7 +17,7 @@ import json
 import time
 import argparse
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, Optional
 
 import requests
 from slugify import slugify
@@ -46,6 +46,22 @@ def ms_to_mmss(ms: int) -> str:
 
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+
+def remove_thumbnails_for_cover(thumb_dir: Path, cover_path: Path) -> None:
+    """Delete cached thumbnails derived from the provided cover image."""
+    if not cover_path:
+        return
+    try:
+        stem = Path(cover_path).stem
+    except Exception:
+        return
+    if not thumb_dir.exists():
+        return
+    for thumb in thumb_dir.glob(f"{stem}_*x*.png"):
+        try:
+            thumb.unlink()
+        except Exception:
+            pass
 
 def download_image_to_png(url: str, out_path: Path) -> None:
     """Download image (usually JPEG) and save as PNG."""
@@ -155,7 +171,13 @@ class SpotifyHarvester:
         return tracks
 
     # ---- Album harvesting ----
-    def harvest_albums(self, tracks: List[Dict], image_dir: Path) -> Dict[str, Dict]:
+    def harvest_albums(
+        self,
+        tracks: List[Dict],
+        image_dir: Path,
+        existing_album_ids: Optional[Set[str]] = None,
+        overwrite: bool = False,
+    ) -> Dict[str, Dict]:
         """
         Given a bunch of tracks, collect unique album IDs and extract album-level info.
         Saves cover art PNGs.
@@ -163,6 +185,8 @@ class SpotifyHarvester:
         """
         sp = self.sp
         ensure_dir(image_dir)
+        if existing_album_ids is None:
+            existing_album_ids = set()
 
         album_ids: List[str] = []
         for t in tracks:
@@ -191,7 +215,7 @@ class SpotifyHarvester:
                 thumb_url = pick_smallest_image(album.get("images", []))
                 album_slug = slugify(f"{artists} - {album_name} ({year or 'unknown'})")
                 png_path = image_dir / f"{album_slug}.png"
-                if cover_url:
+                if cover_url and (overwrite or album_id not in existing_album_ids):
                     try:
                         download_image_to_png(cover_url, png_path)
                     except Exception as e:
@@ -243,7 +267,7 @@ class SpotifyHarvester:
 
 # --------------- CLI ----------------
 
-def main():
+def main(argv: Optional[List[str]] = None):
     ap = argparse.ArgumentParser(description="Harvest album metadata & covers from a Spotify link.")
     ap.add_argument("--url", help="Spotify playlist/album/track URL or URI",
                     default="https://open.spotify.com/playlist/0r3EAAP07Wc5JOSHRNhHmF?si=59e1f0d895d84f7e")
@@ -251,11 +275,27 @@ def main():
     ap.add_argument("--json_name", default="albums.json", help="Name of JSON file to write")
     ap.add_argument("--fresh", action="store_true",
                 help="Ignore existing albums.json and rebuild from scratch.")
-    args = ap.parse_args()
+    ap.add_argument("--overwrite", action="store_true",
+                    help="Replace existing album metadata and covers when IDs match.")
+    args = ap.parse_args(argv)
 
     out_dir = Path(args.out)
     images_dir = out_dir / "images"
+    thumbs_dir = out_dir / "thumbs"
+    ensure_dir(out_dir)
     ensure_dir(images_dir)
+
+    json_path = out_dir / args.json_name
+    existing_doc = {} if args.fresh else _load_existing_json(json_path)
+    if not isinstance(existing_doc, dict):
+        existing_doc = {}
+    existing_albums_list = existing_doc.get("albums", []) if existing_doc else []
+    existing_index = {}
+    for idx, album in enumerate(existing_albums_list):
+        aid = album.get("album_id")
+        if aid:
+            existing_index[aid] = idx
+    existing_ids_before = set(existing_index.keys())
 
     harvester = SpotifyHarvester()
     kind, sid = harvester.parse_url(args.url)
@@ -264,58 +304,57 @@ def main():
     tracks = harvester.expand_tracks_from_link(kind, sid)
     print(f"[info] Collected {len(tracks)} track(s) from link.")
 
-    albums_meta = harvester.harvest_albums(tracks, images_dir)
+    albums_meta = harvester.harvest_albums(
+        tracks,
+        images_dir,
+        existing_album_ids=existing_ids_before,
+        overwrite=args.overwrite,
+    )
 
-    # Map back which songs led us to which albums (optional trace)
-    song_to_album = []
-    for t in tracks:
-        if not t or not t.get("id"):
-            continue
-        album = t.get("album", {})
-        song_to_album.append({
-            "track_id": t["id"],
-            "track_title": t.get("name"),
-            "album_id": album.get("id"),
-            "album_name": album.get("name")
-        })
+    new_albums = list(albums_meta.values())
+    duplicate_ids = [aid for aid in albums_meta if aid in existing_ids_before]
+    new_album_ids = [aid for aid in albums_meta if aid not in existing_ids_before]
 
-    output = {
-        "source_link": args.url,
-        "harvested_albums_count": len(albums_meta),
-        "albums": list(albums_meta.values()),
-        "trace_tracks_to_albums": song_to_album
-    }
+    if args.fresh or not existing_albums_list:
+        merged_albums = new_albums
+    else:
+        if args.overwrite:
+            merged_albums = list(existing_albums_list)
+            index_map = existing_index.copy()
+            for album in new_albums:
+                aid = album["album_id"]
+                if aid in index_map:
+                    old_entry = merged_albums[index_map[aid]]
+                    remove_thumbnails_for_cover(thumbs_dir, old_entry.get("cover_png"))
+                    merged_albums[index_map[aid]] = album
+                else:
+                    index_map[aid] = len(merged_albums)
+                    merged_albums.append(album)
+        else:
+            merged_albums = list(existing_albums_list)
+            seen_ids = set(existing_ids_before)
+            for album in new_albums:
+                aid = album["album_id"]
+                if aid in seen_ids:
+                    continue
+                merged_albums.append(album)
+                seen_ids.add(aid)
 
-    ensure_dir(out_dir)
-    json_path = out_dir / args.json_name
-    existing = {} if getattr(args, "fresh", False) else _load_existing_json(json_path)
+    if duplicate_ids:
+        if args.overwrite:
+            consequence = "overwrite=True so stored metadata and cached thumbnails were replaced"
+        else:
+            consequence = "overwrite=False so stored metadata and cached thumbnails were left untouched"
+        print(f"[info] Harvest returned {len(duplicate_ids)} album(s) already in albums.json; {consequence}.")
+    else:
+        print("[info] No overlapping album IDs with existing library.")
 
-    if existing:
-        # Index existing albums by album_id
-        existing_idx = {a["album_id"]: a for a in existing.get("albums", [])}
+    if new_album_ids:
+        print(f"[info] Added {len(new_album_ids)} new album(s).")
+    else:
+        print("[info] No brand-new albums were added.")
 
-        # Overwrite/insert with latest scraped albums
-        for alb in output["albums"]:
-            existing_idx[alb["album_id"]] = alb
-
-        merged_albums = list(existing_idx.values())
-
-        # Merge trace (deduplicate by track_id+album_id)
-        existing_trace = existing.get("trace_tracks_to_albums", [])
-        seen = {(t.get("track_id"), t.get("album_id")) for t in existing_trace}
-        for t in output["trace_tracks_to_albums"]:
-            key = (t.get("track_id"), t.get("album_id"))
-            if key not in seen:
-                existing_trace.append(t)
-                seen.add(key)
-
-        # Keep the newest source link (or append if you prefer)
-        output = {
-            "source_link": output.get("source_link"),
-            "harvested_albums_count": len(merged_albums),
-            "albums": merged_albums,
-            "trace_tracks_to_albums": existing_trace
-        }
+    output = {"albums": merged_albums}
 
     # Write atomically (optional but safer)
     tmp_path = json_path.with_suffix(".tmp")

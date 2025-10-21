@@ -2,3 +2,4 @@
 .env
 output_spotify/
 **/__pycache__/
+old_saves/

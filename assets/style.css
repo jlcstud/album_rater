@@ -216,3 +216,109 @@ a, a:link, a:visited { outline: 1px solid rgba(255,0,0,0.5); }
   background: #15171c;
   text-align: center;
 }
+
+/* Album histogram */
+.album-hist-page {
+  display: flex;
+  flex-direction: column;
+  padding: 0 16px 24px;
+  min-height: calc(100vh - 64px);
+  gap: 8px;
+}
+
+.album-hist-chart {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: flex-start;
+  align-items: flex-start;
+  padding: 8px;
+  overflow: auto;
+  background: #111419;
+  border-radius: 12px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+  align-self: center;
+  width: fit-content;
+  height: fit-content;
+}
+
+.album-hist-chart svg {
+  flex: 0 0 auto;
+  max-width: none;
+}
+
+.album-hist-tooltip {
+  pointer-events: none;
+}
+
+.album-hist-tooltip-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.album-hist-tooltip-row {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+
+.album-hist-thumb {
+  width: 64px;
+  height: 64px;
+  border-radius: 10px;
+  object-fit: cover;
+  box-shadow: 0 6px 16px rgba(0,0,0,0.45);
+  background: #1a1f26;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.album-hist-thumb--empty {
+  color: #5a6370;
+  font-size: 0.75rem;
+}
+
+.album-hist-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.album-hist-title {
+  font-weight: 700;
+  font-size: 1rem;
+  color: #f3f6fb;
+}
+
+.album-hist-artist {
+  font-size: 0.85rem;
+  color: #9aa3ad;
+}
+
+.album-hist-stats {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 0.82rem;
+  color: #dfe2e7;
+}
+
+.album-hist-stat {
+  white-space: nowrap;
+}
+
+.album-hist-tier {
+  font-weight: 700;
+}
+
+.album-hist-empty {
+  width: 100%;
+  padding: 42px 0;
+  text-align: center;
+  font-size: 0.95rem;
+  background: #15171c;
+  border-radius: 12px;
+}
