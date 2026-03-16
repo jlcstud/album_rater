@@ -566,11 +566,17 @@ def top_nav():
                 className="nav-tierlist-link direct-link",
                 style={"textDecoration":"none", "display":"inline-block", "padding":"0", "margin":"0"}
             ),
-            html.A(
-                dbc.Button("Hist", color="secondary", className="me-2", id="album-hist-btn"),
-                href="/album-hist",
-                className="nav-album-hist-link direct-link",
-                style={"textDecoration":"none", "display":"inline-block", "padding":"0", "margin":"0"}
+            dbc.DropdownMenu(
+                children=[
+                    dbc.DropdownMenuItem("Albums", href="/album-hist", className="direct-link"),
+                    dbc.DropdownMenuItem("Songs", href="/song-hist", className="direct-link"),
+                ],
+                nav=True,
+                in_navbar=True,
+                label="Hist",
+                color="secondary",
+                className="me-2",
+                id="hist-dropdown",
             ),
             # Settings button (gear icon) - appears next to Home
             html.A(
@@ -1471,6 +1477,280 @@ def layout_album_hist():
         html.Div([content], className="album-hist-page")
     ])
 
+
+###############################
+# Song Histogram (per-track)
+###############################
+
+SONG_HIST_EVENTS = [
+    {"event": "pointerdown",  "props": ["type", "offsetX", "offsetY", "buttons"]}
+]
+
+SONG_HIST_INFO_BASE_STYLE = dict(HIST_TOOLTIP_BASE_STYLE)
+SONG_HIST_INFO_BASE_STYLE.update({"pointerEvents": "auto"})
+
+def _collect_song_histogram_rows() -> List[Dict[str, object]]:
+    """Collect rows for each track across all albums. Each row includes album context for tier/color."""
+    rows: List[Dict[str, object]] = []
+    # Prepare rank/tier mapping for albums
+    rank_rows = _rank_rows()
+    rank_map = {aid: idx for idx, (aid, _mean) in enumerate(rank_rows)}
+    total_ranked = len(rank_rows)
+    for aid, alb in ALBUMS.items():
+        ensure_rating_struct(aid)
+        ratings = RATINGS[aid]["ratings"]
+        ignored = RATINGS[aid]["ignored"]
+        tier_label, tier_color = (None, None)
+        if aid in rank_map:
+            tier_label, tier_color = tier_for_rank(rank_map[aid], total_ranked)
+        tier_label = tier_label or "—"
+        tier_color = tier_color or "#3a4651"
+        cover_path = Path(alb.get("cover_png", ""))
+        thumb_src = ""
+        try:
+            if cover_path.exists():
+                thumb_path = get_or_make_thumb(cover_path, (96, 96))
+                thumb_src = image_to_data_uri(thumb_path)
+        except Exception:
+            thumb_src = ""
+        for ix, track in enumerate(alb.get("tracks", [])):
+            val = None
+            if ix < len(ratings):
+                val = ratings[ix]
+            ig = False
+            if ix < len(ignored):
+                ig = ignored[ix]
+            # Only include rated and non-ignored tracks
+            if val is None or ig:
+                continue
+            rows.append({
+                "album_id": aid,
+                "track_ix": ix,
+                "rating": float(val),
+                "title": track.get("title", "Unknown"),
+                "duration_ms": track.get("duration_ms", 0),
+                "album_name": alb.get("album_name", "Unknown Album"),
+                "artists": alb.get("artists", ""),
+                "tier": tier_label,
+                "tier_color": tier_color,
+                "thumb": thumb_src
+            })
+    # sort by rating desc
+    rows.sort(key=lambda r: r["rating"], reverse=True)
+    return rows
+
+
+def _build_song_histogram_svg(rows: List[Dict[str, object]], theme: Dict) -> Tuple[List, Dict[str, object]]:
+    if not rows:
+        return [], {}
+    values = np.array([r["rating"] for r in rows], dtype=float)
+    min_val = float(values.min())
+    max_val = float(values.max())
+    # Bins centered on single decimals: centers at ..., 4.3, 4.4, 4.5, ... with width 0.1 (i.e. [x-0.05, x+0.05])
+    start_center = math.floor(min_val * 10.0) / 10.0
+    end_center = math.ceil(max_val * 10.0) / 10.0
+    bin_width = 0.1
+    domain_l = start_center - 0.05
+    domain_r = end_center + 0.05
+    if domain_r <= domain_l:
+        domain_r = domain_l + bin_width
+
+    # number of bins from start_center to end_center inclusive
+    n_bins = int(round((end_center - start_center) / bin_width)) + 1
+    bins: List[List[Dict[str, object]]] = [[] for _ in range(max(n_bins, 1))]
+    for row in rows:
+        # Determine bin index using domain_l and fixed width 0.1
+        idx = int(math.floor((row["rating"] - domain_l) / bin_width))
+        if idx < 0:
+            idx = 0
+        elif idx >= n_bins:
+            idx = n_bins - 1
+        bins[idx].append(row)
+    for bucket in bins:
+        bucket.sort(key=lambda r: r["rating"], reverse=True)
+    max_count = max([len(bucket) for bucket in bins] + [1])
+    unit = HIST_PLOT_H / max_count
+    vertical_gap_px = min(unit * 0.035, 6.0)
+    # Decrease horizontal gaps by ~50% compared to album histogram
+    horizontal_gap_ratio = (0.2 / 3.0) * 0.5
+    accents = theme.get("accents", DEFAULT_THEME["accents"]) 
+
+    def _x_to_px(val: float) -> float:
+        return HIST_MARGIN_L + (val - domain_l) * (HIST_PLOT_W / (domain_r - domain_l))
+
+    svg_children: List = []
+    svg_children.append(Rect(
+        x=HIST_MARGIN_L,
+        y=HIST_MARGIN_T,
+        width=HIST_PLOT_W,
+        height=HIST_PLOT_H,
+        fill=theme.get("bg_dark", DEFAULT_THEME["bg_dark"]),
+        stroke="#1e252d",
+        strokeWidth=2
+    ))
+
+    # Horizontal grid / y-axis labels (every 10)
+    for tick in range(0, max_count + 1, 10 if max_count >= 10 else max(1, max_count)):
+        y = HIST_MARGIN_T + HIST_PLOT_H - tick * unit
+        svg_children.append(Line(
+            x1=HIST_MARGIN_L,
+            y1=y,
+            x2=HIST_MARGIN_L + HIST_PLOT_W,
+            y2=y,
+            stroke="#29333b",
+            strokeWidth=1,
+            style={"pointerEvents": "none", "opacity": 0.9}
+        ))
+        svg_children.append(Text(
+            str(tick),
+            x=HIST_MARGIN_L - 14,
+            y=y + 4,
+            fill="#a6b2bd",
+            textAnchor="end",
+            style={"fontSize": "13px", "pointerEvents": "none"}
+        ))
+
+    # Axis lines
+    svg_children.append(Line(
+        x1=HIST_MARGIN_L,
+        y1=HIST_MARGIN_T,
+        x2=HIST_MARGIN_L,
+        y2=HIST_MARGIN_T + HIST_PLOT_H,
+        stroke="#4b5662",
+        strokeWidth=2
+    ))
+    svg_children.append(Line(
+        x1=HIST_MARGIN_L,
+        y1=HIST_MARGIN_T + HIST_PLOT_H,
+        x2=HIST_MARGIN_L + HIST_PLOT_W,
+        y2=HIST_MARGIN_T + HIST_PLOT_H,
+        stroke="#4b5662",
+        strokeWidth=2
+    ))
+
+    tick_step = 0.2
+    tick_start = math.ceil(domain_l / tick_step) * tick_step
+    ticks = []
+    t = tick_start
+    while t <= domain_r + 1e-9:
+        ticks.append(round(t, 10))
+        t += tick_step
+    for tick in ticks:
+        px = _x_to_px(tick)
+        svg_children.append(Line(
+            x1=px,
+            y1=HIST_MARGIN_T + HIST_PLOT_H,
+            x2=px,
+            y2=HIST_MARGIN_T + HIST_PLOT_H + 12,
+            stroke="#4b5662",
+            strokeWidth=1.3
+        ))
+        svg_children.append(Text(
+            f"{tick:.1f}".rstrip("0").rstrip("."),
+            x=px,
+            y=HIST_MARGIN_T + HIST_PLOT_H + 34,
+            fill="#aab4bf",
+            textAnchor="middle",
+            style={"fontSize": "12px", "pointerEvents": "none"}
+        ))
+
+    rect_meta: List[Dict[str, float]] = []
+    song_payload: Dict[str, Dict[str, object]] = {}
+
+    for bin_idx, bucket in enumerate(bins):
+        bin_left_val = domain_l + bin_idx * bin_width
+        bin_right_val = bin_left_val + bin_width
+        bar_left = _x_to_px(bin_left_val)
+        bar_right = _x_to_px(bin_right_val)
+        bin_width_px = bar_right - bar_left
+        h_gap_px = bin_width_px * horizontal_gap_ratio
+        bar_width = max(bin_width_px - h_gap_px, 2.0)
+        bar_left += h_gap_px / 2.0
+
+        y_bottom = HIST_MARGIN_T + HIST_PLOT_H
+        color_seed = bin_idx % len(accents)
+        for song in bucket:
+            rect_height = max(unit - vertical_gap_px, 4.0)
+            rect_y = y_bottom - rect_height
+            # color by album tier
+            fill_color = song.get("tier_color") or accents[color_seed]
+            svg_children.append(Rect(
+                x=bar_left,
+                y=rect_y,
+                width=bar_width,
+                height=rect_height,
+                fill=fill_color,
+                stroke="#11161d",
+                strokeWidth=1,
+                style={"cursor": "pointer", "fillOpacity": 0.9}
+            ))
+            key = f"{song['album_id']}:{song['track_ix']}"
+            rect_meta.append({
+                "song_key": key,
+                "x": bar_left,
+                "y": rect_y,
+                "width": bar_width,
+                "height": rect_height,
+                "rating": song["rating"]
+            })
+            if key not in song_payload:
+                song_payload[key] = {
+                    "title": song.get("title"),
+                    "duration_ms": song.get("duration_ms"),
+                    "rating": song.get("rating"),
+                    "album_id": song.get("album_id"),
+                    "album_name": song.get("album_name"),
+                    "artists": song.get("artists"),
+                    "tier": song.get("tier"),
+                    "tier_color": song.get("tier_color"),
+                    "thumb": song.get("thumb")
+                }
+            y_bottom = rect_y - vertical_gap_px
+
+    store_data = {
+        "rects": rect_meta,
+        "songs": song_payload,
+        "svg": {"width": HIST_SVG_W, "height": HIST_SVG_H},
+        "domain": {"left": domain_l, "right": domain_r, "bin_width": bin_width}
+    }
+    return svg_children, store_data
+
+
+def layout_song_hist():
+    rows = _collect_song_histogram_rows()
+    if not rows:
+        content = html.Div("No rated songs available yet. Rate tracks to see the histogram.", className="album-hist-empty muted")
+    else:
+        svg_children, store_data = _build_song_histogram_svg(rows, DEFAULT_THEME)
+        content = html.Div([
+            dcc.Store(id="song-hist-geom", data=store_data),
+            EventListener(
+                id="song-hist-events",
+                events=SONG_HIST_EVENTS,
+                logging=False,
+                children=Svg(
+                    id="song-hist-svg",
+                    width=HIST_SVG_W,
+                    height=HIST_SVG_H,
+                    viewBox=f"0 0 {HIST_SVG_W} {HIST_SVG_H}",
+                    preserveAspectRatio="xMidYMid meet",
+                    style={
+                        "width": f"{HIST_SVG_W}px",
+                        "height": f"{HIST_SVG_H}px",
+                        "background": DEFAULT_THEME["bg_dark"],
+                        "userSelect": "none",
+                        "touchAction": "none"
+                    },
+                    children=svg_children
+                )
+            ),
+            html.Div(id="song-hist-info", className="album-hist-tooltip", style=dict(SONG_HIST_INFO_BASE_STYLE))
+        ], className="album-hist-chart")
+    return html.Div([
+        top_nav(),
+        html.Div([content], className="album-hist-page")
+    ])
+
 # --- Shuffle callback for unrated picks ---
 @app.callback(
     Output("unrated-picks", "children"),
@@ -1916,6 +2196,8 @@ def router(pathname:str):
         return [layout_tierlist()]
     if pathname == "/album-hist":
         return [layout_album_hist()]
+    if pathname == "/song-hist":
+        return [layout_song_hist()]
     if pathname == "/settings":
         return [layout_settings()]
     if pathname.startswith("/album/"):
@@ -2328,6 +2610,67 @@ def handle_album_hist_events(_n_events, evt, geom):
     if etype == "pointerdown" and buttons in (0, 1, None):
         navigate = f"/album/{rect['album_id']}"
     return tooltip_children, style, navigate
+
+
+@app.callback(
+    Output("song-hist-info", "children"),
+    Output("song-hist-info", "style"),
+    Input("song-hist-events", "n_events"),
+    State("song-hist-events", "event"),
+    State("song-hist-geom", "data"),
+    prevent_initial_call=True
+)
+def handle_song_hist_events(_n_events, evt, geom):
+    base_style = dict(SONG_HIST_INFO_BASE_STYLE)
+    if not evt or not geom:
+        return dash.no_update, base_style
+    rect = None
+    rects = geom.get("rects") if isinstance(geom, dict) else None
+    x = evt.get("offsetX") if evt else None
+    y = evt.get("offsetY") if evt else None
+    if rects and x is not None and y is not None:
+        rect = _hist_find_rect(rects, float(x), float(y))
+    # If click didn't hit a rect, clear the info box
+    if rect is None:
+        return html.Div(), base_style
+    songs = geom.get("songs", {}) if isinstance(geom, dict) else {}
+    info = songs.get(rect.get("song_key"))
+    if not info:
+        return html.Div(), base_style
+    thumb_src = info.get("thumb")
+    thumb_element = html.A(html.Img(src=thumb_src, className="album-hist-thumb"), href=f"/album/{info.get('album_id')}") if thumb_src else html.Div("No art", className="album-hist-thumb album-hist-thumb--empty")
+    rating_val = info.get("rating")
+    rating_text = f"{rating_val:.2f}" if isinstance(rating_val, (int, float)) else "—"
+    tier_label = info.get("tier") or "—"
+    tier_color = info.get("tier_color") or "#dfe2e7"
+    duration = ms_to_mmss(int(info.get("duration_ms", 0) or 0))
+    # Build info box: song title on top, then album thumb + album name/artist, then stats
+    tooltip_children = html.Div([
+        html.Div([
+            html.Div(info.get("title", "Unknown"), className="album-hist-title"),
+        ], className="album-hist-tooltip-row"),
+        html.Div([
+            thumb_element,
+            html.Div([
+                html.Div(html.A(info.get("album_name", "Unknown Album"), href=f"/album/{info.get('album_id')}", className="album-hist-title direct-link"), className="mb-1"),
+                html.Div(info.get("artists", ""), className="album-hist-artist"),
+                html.Div([
+                    html.Span(f"Rating {rating_text}", className="album-hist-stat"),
+                    html.Span(f"Duration {duration}", className="album-hist-stat ms-2")
+                ], className="album-hist-stats")
+            ], className="album-hist-meta")
+        ], className="album-hist-tooltip-row")
+    ], className="album-hist-tooltip-inner")
+    svg_dim = geom.get("svg", {}) if isinstance(geom, dict) else {}
+    svg_w = float(svg_dim.get("width", HIST_SVG_W))
+    svg_h = float(svg_dim.get("height", HIST_SVG_H))
+    tooltip_width = 300.0
+    tooltip_height = 120.0
+    left = min(max(float(x) + 18.0, 8.0), svg_w - tooltip_width - 8.0)
+    top = min(max(float(y) + 18.0, 8.0), svg_h - tooltip_height - 8.0)
+    style = dict(SONG_HIST_INFO_BASE_STYLE)
+    style.update({"display": "block", "left": f"{left}px", "top": f"{top}px"})
+    return tooltip_children, style
 
 @app.callback(
     Output({"type":"album-svg","album":MATCH}, "children", allow_duplicate=True),

@@ -1,5 +1,5 @@
 # Environment files
 .env
-output_spotify/
+output_spotify/images/
 **/__pycache__/
 old_saves/
